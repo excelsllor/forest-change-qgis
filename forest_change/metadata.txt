@@ -1,0 +1,13 @@
+[general]
+name=Forest Change Detection
+qgisMinimumVersion=3.16
+description=Automatic detection and classification of forest changes (logging / windfall / fire) from bi-temporal Sentinel-2 imagery using a ChangeMamba ONNX model.
+version=0.1.0
+author=Forest Hackathon Team
+email=team@example.com
+about=Detects forest cover changes between two dates. Uses a Mamba (ChangeMamba) neural network exported to ONNX, runs with onnxruntime (DirectML / CUDA / ROCm / CPU). Outputs a class raster (no-change / logging / windfall / fire) and a GeoPackage of change polygons with type and area attributes.
+tracker=
+repository=
+tags=forest,change detection,mamba,onnx,remote sensing
+category=Analysis
+icon=icon.png

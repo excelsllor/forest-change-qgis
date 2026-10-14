@@ -1,0 +1,30 @@
+{
+  "tile": 256,
+  "channels": 3,
+  "bands": [
+    "B11",
+    "B08",
+    "B04"
+  ],
+  "scale": 10000.0,
+  "clip": 0.35,
+  "to_255": true,
+  "mean": [
+    123.675,
+    116.28,
+    103.53
+  ],
+  "std": [
+    58.395,
+    57.12,
+    57.375
+  ],
+  "output_layout": "concat(change[2], type[3])",
+  "classes": {
+    "0": "no_change",
+    "1": "logging",
+    "2": "windfall",
+    "3": "fire"
+  },
+  "max_abs_diff_vs_torch": 7.62939453125e-06
+}

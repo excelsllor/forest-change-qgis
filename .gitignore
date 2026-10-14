@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.zip
+forest_change/model/*.onnx
+forest_change/model/*.pth
