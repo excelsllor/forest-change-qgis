@@ -38,7 +38,8 @@
 
 Модель **не входит в репозиторий** (263 МБ, лимит GitHub — 100 МБ на файл).
 Скачайте её из соседнего репозитория с моделями:
-`forest-change-model` → *Releases* → `forest_change_mt_256.onnx`,
+[`forest-change-model` → Releases](https://github.com/excelsllor/forest-change-model/releases/tag/v1.0)
+→ `forest_change_mt_256.onnx`,
 и положите в `forest_change/model/forest_change_mt_256.onnx`
 (рядом — `forest_change_mt_256.json` с параметрами нормализации).
 
