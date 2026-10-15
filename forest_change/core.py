@@ -1,13 +1,16 @@
-"""Core inference for the Forest Change QGIS plugin.
+"""Core inference for the Forest Change QGIS plugin (DOFA, CPU).
 
-Runs a ChangeMamba ONNX model over bi-temporal Sentinel-2 tiles using
-onnxruntime (auto EP: DirectML / CUDA / ROCm / CPU) and GDAL for I/O.
+Runs a siamese DOFA ONNX classifier over bi-temporal Sentinel-2 tiles using
+onnxruntime (CPU by default; DirectML/CUDA/ROCm used if available) and GDAL for I/O.
+
+Model: 6 bands B02,B03,B04,B08,B11,B12 (reflectance/10000), 32 px chips (320 m)
+upscaled to 128 px; outputs 4 classes: no_change / logging / windfall / fire.
 
 Two input modes:
   period  - mosaics stored as <date>_<band>.tif (+ <date>_SCL.tif) in a folder
-  files   - two multi-band GeoTIFFs (T1, T2) with selected band numbers
+  files   - two multi-band GeoTIFFs (T1, T2) with 6 selected band numbers
 
-Outputs in out_dir: classes.tif, changes.gpkg, summary.json, preview.png
+Outputs in out_dir: classes.tif, changes.gpkg, summary.json
 """
 
 import json
@@ -18,12 +21,15 @@ from osgeo import gdal, ogr, osr
 
 gdal.UseExceptions()
 
-MEAN = np.array([123.675, 116.28, 103.53], dtype=np.float32).reshape(3, 1, 1)
-STD = np.array([58.395, 57.12, 57.375], dtype=np.float32).reshape(3, 1, 1)
 CLASSES = {0: "no_change", 1: "logging", 2: "windfall", 3: "fire"}
+BANDS6 = ("B02", "B03", "B04", "B08", "B11", "B12")
 SCL_INVALID = [0, 1, 3, 8, 9, 10, 11]
 PROVIDER_ORDER = ["DmlExecutionProvider", "CUDAExecutionProvider", "ROCMExecutionProvider",
                   "CoreMLExecutionProvider", "CPUExecutionProvider"]
+CHIP = 32          # 320 m at 10 m resolution (same scale as the training chips)
+SIZE = 128         # model input
+BATCH = 64
+SCALE = 10000.0
 
 
 def pick_providers():
@@ -32,10 +38,15 @@ def pick_providers():
     return [p for p in PROVIDER_ORDER if p in avail] or ["CPUExecutionProvider"]
 
 
-def _norm(raw):
-    x = raw.astype(np.float32) / 10000.0
-    x = np.clip(x / 0.35, 0, 1) * 255.0
-    return (x - MEAN) / STD
+def _resize_bilinear(a, size):
+    """a: (C,H,W) -> (C,size,size) bilinear (numpy only, works in QGIS Python)."""
+    C, H, W = a.shape
+    xi = np.linspace(0, W - 1, size)
+    yi = np.linspace(0, H - 1, size)
+    x0 = np.floor(xi).astype(int); x1 = np.minimum(x0 + 1, W - 1); wx = (xi - x0)[None, None, :]
+    y0 = np.floor(yi).astype(int); y1 = np.minimum(y0 + 1, H - 1); wy = (yi - y0)[None, :, None]
+    tmp = a[:, :, x0] * (1 - wx) + a[:, :, x1] * wx
+    return tmp[:, y0, :] * (1 - wy) + tmp[:, y1, :] * wy
 
 
 class Model:
@@ -48,20 +59,14 @@ class Model:
             self.sess = ort.InferenceSession(buf, providers=providers)
         except Exception:
             self.sess = ort.InferenceSession(buf, providers=["CPUExecutionProvider"])
-        self.inames = [i.name for i in self.sess.get_inputs()]
 
     @property
     def provider(self):
         return self.sess.get_providers()[0]
 
     def run(self, pre, post):
-        out = self.sess.run(None, {self.inames[0]: pre, self.inames[1]: post})[0]
-        return out[0]  # (5, T, T)
-
-
-def _softmax(x, axis=0):
-    e = np.exp(x - x.max(axis=axis, keepdims=True))
-    return e / e.sum(axis=axis, keepdims=True)
+        out = self.sess.run(None, {"pre": pre, "post": post})[0]
+        return out  # (B, 4)
 
 
 # ---------------------------------------------------------------- IO helpers
@@ -70,23 +75,6 @@ def _gdal_open(path):
     if ds is None:
         raise IOError(f"Cannot open {path}")
     return ds
-
-
-def _read_mosaic_tile(mosaic_dir, date, bands, c0, r0, t, gsize):
-    out = np.zeros((3, t, t), dtype=np.float32)
-    for i, b in enumerate(bands):
-        p = os.path.join(mosaic_dir, f"{date}_{b}.tif")
-        ds = _gdal_open(p)
-        out[i] = ds.GetRasterBand(1).ReadAsArray(c0, r0, t, t)
-    return out
-
-
-def _read_stack_tile(path, band_idx, c0, r0, t):
-    ds = _gdal_open(path)
-    out = np.zeros((3, t, t), dtype=np.float32)
-    for i, b in enumerate(band_idx):
-        out[i] = ds.GetRasterBand(b).ReadAsArray(c0, r0, t, t)
-    return out
 
 
 def _grid_from(path):
@@ -102,26 +90,43 @@ def _read_band1(path, c0, r0, w, h):
     return arr
 
 
+def _read_stack(path, band_idx, c0, r0, w, h):
+    """6 bands from a multi-band GeoTIFF -> (6,h,w) float32."""
+    ds = _gdal_open(path)
+    out = np.zeros((len(band_idx), h, w), dtype=np.float32)
+    for i, b in enumerate(band_idx):
+        out[i] = ds.GetRasterBand(b).ReadAsArray(c0, r0, w, h)
+    del ds
+    return out
+
+
+def _read_mosaic6(mosaic_dir, date, c0, r0, w, h):
+    """6 bands from <date>_<band>.tif -> (6,h,w) float32."""
+    out = np.zeros((6, h, w), dtype=np.float32)
+    for i, b in enumerate(BANDS6):
+        p = os.path.join(mosaic_dir, f"{date}_{b}.tif")
+        ds = _gdal_open(p)
+        out[i] = ds.GetRasterBand(1).ReadAsArray(c0, r0, w, h)
+        del ds
+    return out
+
+
 # ---------------------------------------------------------------- main engine
 def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, t1_path=None,
-            t2_path=None, band_idx=(1, 2, 3), aoi_bbox=None, tile=256, stride=128,
-            progress=None, tile_fn=None):
+            t2_path=None, band_idx=None, aoi_bbox=None, progress=None):
     """mode: 'period' or 'files'. Returns summary dict."""
     os.makedirs(out_dir, exist_ok=True)
-    date1 = date2 = None
     if mode == "period":
         try:
             from . import periods
-        except Exception:  # standalone/testing import
+        except Exception:
             import periods
         date1, date2 = periods.PERIOD_DATES[period]
-        # grid from any mosaic band
         ref = os.path.join(mosaic_dir, f"{date1}_B08.tif")
     else:
         ref = t1_path
     gt, W, H, proj = _grid_from(ref)
 
-    # AOI window
     if aoi_bbox:
         xmin, ymin, xmax, ymax = aoi_bbox
         c0 = max(0, int((xmin - gt[0]) / gt[1]))
@@ -132,44 +137,47 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, t1_path=Non
         c0, r0, c1, r1 = 0, 0, W, H
     w, h = c1 - c0, r1 - r0
 
-    model = Model(model_path)
-    acc = np.zeros((4, h, w), dtype=np.float32)
-    cnt = np.zeros((h, w), dtype=np.float32)
-    coords = [(r, c) for r in range(0, h - tile + 1, stride) for c in range(0, w - tile + 1, stride)]
-    if not coords:
-        coords = [(max(0, h - tile), max(0, w - tile))]
+    if progress:
+        progress(1)
+    if mode == "period":
+        A = _read_mosaic6(mosaic_dir, date1, c0, r0, w, h)
+        B = _read_mosaic6(mosaic_dir, date2, c0, r0, w, h)
+    else:
+        idx = band_idx or (1, 2, 3, 4, 5, 6)
+        A = _read_stack(t1_path, idx, c0, r0, w, h)
+        B = _read_stack(t2_path, idx, c0, r0, w, h)
 
-    for i, (r, c) in enumerate(coords):
-        gc, gr = c0 + c, r0 + r
-        if mode == "period":
-            a = _norm(_read_mosaic_tile(mosaic_dir, date1, ("B11", "B08", "B04"), gc, gr, tile, gt))
-            b = _norm(_read_mosaic_tile(mosaic_dir, date2, ("B11", "B08", "B04"), gc, gr, tile, gt))
-        else:
-            a = _norm(_read_stack_tile(t1_path, band_idx, gc, gr, tile))
-            b = _norm(_read_stack_tile(t2_path, band_idx, gc, gr, tile))
-        out = model.run(a[None], b[None])
-        pch = _softmax(out[:2], 0)
-        pty = _softmax(out[2:], 0)
-        prob = np.stack([pch[0], pch[1] * pty[0], pch[1] * pty[1], pch[1] * pty[2]])
-        rr, cc = min(r, h - tile), min(c, w - tile)
-        acc[:, rr:rr + tile, cc:cc + tile] += prob
-        cnt[rr:rr + tile, cc:cc + tile] += 1
-        if progress and (i % 25 == 0 or i == len(coords) - 1):
-            progress(int(100 * (i + 1) / len(coords)))
-    cnt[cnt == 0] = 1
-    cls = (acc / cnt).argmax(0).astype(np.uint8)
-
-    # nodata / cloud mask
     invalid = np.zeros((h, w), dtype=bool)
+    invalid |= (A[3] == 0) | (B[3] == 0)          # B08 nodata
     if mode == "period":
         for date in (date1, date2):
             p = os.path.join(mosaic_dir, f"{date}_SCL.tif")
             if os.path.exists(p):
                 scl = _read_band1(p, c0, r0, w, h)
                 invalid |= np.isin(scl, SCL_INVALID)
-        for date in (date1, date2):
-            p = os.path.join(mosaic_dir, f"{date}_B08.tif")
-            invalid |= _read_band1(p, c0, r0, w, h) == 0
+
+    model = Model(model_path)
+    cls = np.zeros((h, w), dtype=np.uint8)
+    coords = [(r, c) for r in range(0, h - CHIP + 1, CHIP) for c in range(0, w - CHIP + 1, CHIP)]
+    if not coords:
+        coords = [(max(0, h - CHIP), max(0, w - CHIP))]
+
+    buf_a, buf_b, buf_pos = [], [], []
+    for i, (r, c) in enumerate(coords):
+        a = A[:, r:r + CHIP, c:c + CHIP]
+        b = B[:, r:r + CHIP, c:c + CHIP]
+        if a.shape[1] < CHIP or a.shape[2] < CHIP:
+            continue
+        buf_a.append(_resize_bilinear(a, SIZE) / SCALE)
+        buf_b.append(_resize_bilinear(b, SIZE) / SCALE)
+        buf_pos.append((r, c))
+        if len(buf_a) >= BATCH or i == len(coords) - 1:
+            logits = model.run(np.stack(buf_a).astype(np.float32), np.stack(buf_b).astype(np.float32))
+            for (rr, cc), k in zip(buf_pos, logits.argmax(1)):
+                cls[rr:rr + CHIP, cc:cc + CHIP] = int(k)
+            buf_a, buf_b, buf_pos = [], [], []
+        if progress and (i % 25 == 0 or i == len(coords) - 1):
+            progress(int(100 * (i + 1) / len(coords)))
     cls[invalid] = 255
 
     cls_path = os.path.join(out_dir, "classes.tif")
@@ -177,7 +185,7 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, t1_path=Non
     gpkg = os.path.join(out_dir, "changes.gpkg")
     _polygonize(cls_path, gpkg, proj)
     summary = {"mode": mode, "period": period, "provider": model.provider,
-               "tile": tile,
+               "chip": CHIP, "scale_m": gt[1],
                "areas_ha": {CLASSES[k]: float((cls == k).sum() * gt[1] * abs(gt[5]) / 1e4) for k in (1, 2, 3)},
                "classes_tif": cls_path, "changes_gpkg": gpkg}
     with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as fh:

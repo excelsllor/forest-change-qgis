@@ -1,0 +1,29 @@
+{
+  "tile": 32,
+  "input": 128,
+  "channels": 6,
+  "bands": [
+    "B02",
+    "B03",
+    "B04",
+    "B08",
+    "B11",
+    "B12"
+  ],
+  "scale": 10000.0,
+  "wavelengths": [
+    0.4966,
+    0.56,
+    0.6645,
+    0.8351,
+    1.6137,
+    2.2024
+  ],
+  "classes": {
+    "0": "no_change",
+    "1": "logging",
+    "2": "windfall",
+    "3": "fire"
+  },
+  "note": "siamese DOFA base @128px, fine-tuned on Vozhegodskoe 32px chips"
+}

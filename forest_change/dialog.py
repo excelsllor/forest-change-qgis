@@ -12,15 +12,16 @@ from qgis.core import QgsProject, QgsRasterLayer, QgsVectorLayer, QgsMapLayer
 from . import periods
 
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model")
-DEFAULT_MODEL = os.path.join(MODEL_DIR, "forest_change_mt_256.onnx")
+DEFAULT_MODEL = os.path.join(MODEL_DIR, "forest_change_dofa128.onnx")
+BANDS6 = ("B02", "B03", "B04", "B08", "B11", "B12")
 
 
 class ForestChangeDialog(QDialog):
     def __init__(self, iface):
         super().__init__(iface.mainWindow())
         self.iface = iface
-        self.setWindowTitle("Forest Change Detection")
-        self.resize(560, 420)
+        self.setWindowTitle("Forest Change Detection (DOFA)")
+        self.resize(560, 460)
         self._build()
 
     def _build(self):
@@ -28,57 +29,61 @@ class ForestChangeDialog(QDialog):
         form = QFormLayout()
 
         self.mode = QComboBox()
-        self.mode.addItems(["Р“РѕС‚РѕРІС‹Рµ РїРµСЂРёРѕРґС‹ (РјРѕР·Р°РёРєРё)", "РЎРІРѕРё СЃРЅРёРјРєРё (T1/T2 GeoTIFF)"])
+        self.mode.addItems(["Готовые периоды (мозаики)", "Свои снимки (T1/T2 GeoTIFF)"])
         self.mode.currentIndexChanged.connect(self._update_mode)
-        form.addRow("Р РµР¶РёРј", self.mode)
+        form.addRow("Режим", self.mode)
 
         self.mosaic_dir = self._path_row()
-        form.addRow("РџР°РїРєР° РјРѕР·Р°РёРє", self.mosaic_dir[0])
+        form.addRow("Папка мозаик", self.mosaic_dir[0])
         self.period = QComboBox()
         self.period.addItems(list(periods.PERIOD_DATES.keys()))
-        form.addRow("РџРµСЂРёРѕРґ", self.period)
+        form.addRow("Период", self.period)
 
         self.t1 = self._path_row()
-        form.addRow("T1 (Р°СЂС…РёРІ)", self.t1[0])
+        form.addRow("T1 (архив)", self.t1[0])
         self.t2 = self._path_row()
-        form.addRow("T2 (С‚РµРєСѓС‰РёР№)", self.t2[0])
+        form.addRow("T2 (текущий)", self.t2[0])
         self.bands = QHBoxLayout()
-        self.b_swir, self.b_nir, self.b_red = QSpinBox(), QSpinBox(), QSpinBox()
-        for sp, val in ((self.b_swir, 11), (self.b_nir, 8), (self.b_red, 4)):
+        self.b_spins = []
+        defaults = (2, 3, 4, 8, 11, 12)
+        for name, val in zip(BANDS6, defaults):
+            sp = QSpinBox()
             sp.setRange(1, 200)
             sp.setValue(val)
+            sp.setPrefix(name + ":")
+            self.b_spins.append(sp)
             self.bands.addWidget(sp)
         bw = QWidget()
         bw.setLayout(self.bands)
-        form.addRow("РљР°РЅР°Р»С‹ SWIR/NIR/Red", bw)
+        form.addRow("Каналы B02..B12", bw)
 
         self.aoi = QComboBox()
-        self.aoi.addItem("Р’РµСЃСЊ СЂР°СЃС‚СЂ", None)
+        self.aoi.addItem("Весь растр", None)
         for layer in QgsProject.instance().mapLayers().values():
             if layer.type() == QgsMapLayer.VectorLayer:
                 self.aoi.addItem(layer.name(), layer.id())
-        form.addRow("AOI (СЃР»РѕР№)", self.aoi)
+        form.addRow("AOI (слой)", self.aoi)
 
         self.out = self._path_row(dir_mode=True)
-        form.addRow("РџР°РїРєР° РІС‹РІРѕРґР°", self.out[0])
+        form.addRow("Папка вывода", self.out[0])
         self.model = self._path_row(file_filter="ONNX (*.onnx)")
         self.model[1].setText(DEFAULT_MODEL)
-        form.addRow("ONNX-РјРѕРґРµР»СЊ", self.model[0])
+        form.addRow("ONNX-модель", self.model[0])
 
         root.addLayout(form)
-        self.status = QLabel("Р“РѕС‚РѕРІРѕ")
+        self.status = QLabel("Готово")
         root.addWidget(self.status)
         self.bar = QProgressBar()
         root.addWidget(self.bar)
 
-        run = QPushButton("Р’С‹СЏРІРёС‚СЊ РёР·РјРµРЅРµРЅРёСЏ")
+        run = QPushButton("Выявить изменения")
         run.clicked.connect(self._run)
         root.addWidget(run)
         self._update_mode()
 
     def _path_row(self, dir_mode=False, file_filter="GeoTIFF (*.tif *.tiff)"):
         edit = QLineEdit()
-        btn = QPushButton("вЂ¦")
+        btn = QPushButton("…")
         row = QHBoxLayout()
         row.addWidget(edit)
         row.addWidget(btn)
@@ -87,9 +92,9 @@ class ForestChangeDialog(QDialog):
 
         def browse():
             if dir_mode:
-                p = QFileDialog.getExistingDirectory(self, "Р’С‹Р±СЂР°С‚СЊ РїР°РїРєСѓ")
+                p = QFileDialog.getExistingDirectory(self, "Выбрать папку")
             else:
-                p, _ = QFileDialog.getOpenFileName(self, "Р’С‹Р±СЂР°С‚СЊ С„Р°Р№Р»", "", file_filter)
+                p, _ = QFileDialog.getOpenFileName(self, "Выбрать файл", "", file_filter)
             if p:
                 edit.setText(p)
         btn.clicked.connect(browse)
@@ -114,14 +119,14 @@ class ForestChangeDialog(QDialog):
         model = self.model[1].text().strip()
         out_dir = self.out[1].text().strip()
         if not os.path.exists(model):
-            QMessageBox.warning(self, "РћС€РёР±РєР°", f"РњРѕРґРµР»СЊ РЅРµ РЅР°Р№РґРµРЅР°:\n{model}")
+            QMessageBox.warning(self, "Ошибка", f"Модель не найдена:\n{model}")
             return
         if not out_dir:
-            QMessageBox.warning(self, "РћС€РёР±РєР°", "РЈРєР°Р¶РёС‚Рµ РїР°РїРєСѓ РІС‹РІРѕРґР°")
+            QMessageBox.warning(self, "Ошибка", "Укажите папку вывода")
             return
         try:
             from . import core
-            self.status.setText("РРЅС„РµСЂРµРЅСЃвЂ¦")
+            self.status.setText("Инференс…")
             self.bar.setValue(0)
             QApplication.setOverrideCursor(1)
 
@@ -138,15 +143,15 @@ class ForestChangeDialog(QDialog):
                 summary = core.predict(
                     "files", model, out_dir, t1_path=self.t1[1].text().strip(),
                     t2_path=self.t2[1].text().strip(),
-                    band_idx=(self.b_swir.value(), self.b_nir.value(), self.b_red.value()),
+                    band_idx=tuple(sp.value() for sp in self.b_spins),
                     aoi_bbox=self._aoi_bbox(), progress=progress)
             self._load_results(summary)
             self.status.setText(
-                "Р“РѕС‚РѕРІРѕ. РџР»РѕС‰Р°РґРё (РіР°): " +
+                "Готово. Площади (га): " +
                 ", ".join(f"{k}={v:.1f}" for k, v in summary["areas_ha"].items()))
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "РћС€РёР±РєР°", f"{exc}\n\n{traceback.format_exc()}")
-            self.status.setText("РћС€РёР±РєР°: " + str(exc))
+            QMessageBox.critical(self, "Ошибка", f"{exc}\n\n{traceback.format_exc()}")
+            self.status.setText("Ошибка: " + str(exc))
         finally:
             QApplication.restoreOverrideCursor()
 
@@ -171,4 +176,3 @@ class ForestChangeDialog(QDialog):
             cats.append(QgsRendererCategory(name, sym, name))
         layer.setRenderer(QgsCategorizedSymbolRenderer("type", cats))
         layer.triggerRepaint()
-
