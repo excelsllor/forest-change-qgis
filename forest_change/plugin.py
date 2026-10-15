@@ -1,7 +1,10 @@
 import os
 
-from qgis.PyQt.QtWidgets import QAction
 from qgis.PyQt.QtGui import QIcon
+try:  # Qt6 (QGIS 4): QAction lives in QtGui
+    from qgis.PyQt.QtGui import QAction
+except ImportError:  # Qt5 (QGIS 3)
+    from qgis.PyQt.QtWidgets import QAction
 
 
 class ForestChangePlugin:
