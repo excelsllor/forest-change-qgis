@@ -120,9 +120,15 @@ class ForestChangeDialog(QDialog):
         self.bar = QProgressBar()
         root.addWidget(self.bar)
 
-        run = QPushButton("Выявить изменения")
-        run.clicked.connect(self._run)
-        root.addWidget(run)
+        b_mask = QPushButton("1. Посчитать маску (алгоритм NDVI/NBR)")
+        b_mask.clicked.connect(self._run_mask)
+        root.addWidget(b_mask)
+        b_types = QPushButton("2. Посчитать изменение по маске (модель)")
+        b_types.clicked.connect(self._run_types)
+        root.addWidget(b_types)
+        b_all = QPushButton("Маска + изменение (всё сразу)")
+        b_all.clicked.connect(self._run_all)
+        root.addWidget(b_all)
         self._update_mode()
         self._refresh_layers()
 
@@ -310,7 +316,53 @@ class ForestChangeDialog(QDialog):
         return (ext.xMinimum(), ext.yMinimum(), ext.xMaximum(), ext.yMaximum())
 
     # ------------------------------------------------------------- run
-    def _run(self):
+    def _mode(self):
+        return "period" if self.mode.currentIndex() == 0 else "files"
+
+    def _params(self):
+        if self.mode.currentIndex() == 0:
+            return dict(period=self.period.currentText(),
+                        mosaic_dir=self.mosaic_dir[1].text().strip(),
+                        aoi_bbox=self._aoi_bbox())
+        return dict(t1_path=self.t1[1].text().strip(),
+                    t2_path=self.t2[1].text().strip(),
+                    band_idx=tuple(sp.value() for sp in self.b_spins),
+                    aoi_bbox=self._aoi_bbox())
+
+    def _progress(self):
+        def progress(p):
+            self.bar.setValue(p)
+            QApplication.processEvents()
+        return progress
+
+    def _run_mask(self):
+        out_dir = self.out[1].text().strip()
+        if not out_dir:
+            QMessageBox.warning(self, "Ошибка", "Укажите папку вывода (маски)")
+            return
+        self._save()
+        try:
+            from . import core
+            self.status.setText("Считаю маску (алгоритм)…")
+            self.bar.setValue(0)
+            QApplication.setOverrideCursor(_WAIT_CURSOR)
+            summary = core.compute_mask(self._mode(), out_dir, progress=self._progress(), **self._params())
+            rl = QgsRasterLayer(summary["mask_tif"], "Маска изменений")
+            if rl.isValid():
+                QgsProject.instance().addMapLayer(rl)
+                if self.auto_apply.isChecked():
+                    self.iface.mapCanvas().setExtent(rl.extent())
+                    self.iface.mapCanvas().refresh()
+            self.status.setText(
+                f"Маска готова: изменённых пикселей {summary['changed_px']} "
+                f"({summary['changed_ha']:.1f} га), порог {summary['thr']}. Файл: {summary['mask_tif']}")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Ошибка", f"{exc}\n\n{traceback.format_exc()}")
+            self.status.setText("Ошибка: " + str(exc))
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _run_types(self):
         model = self.model[1].text().strip()
         out_dir = self.out[1].text().strip()
         if not os.path.exists(model):
@@ -322,29 +374,42 @@ class ForestChangeDialog(QDialog):
         self._save()
         try:
             from . import core
-            self.status.setText("Инференс…")
+            self.status.setText("Классифицирую тип по маске…")
             self.bar.setValue(0)
             QApplication.setOverrideCursor(_WAIT_CURSOR)
-
-            def progress(p):
-                self.bar.setValue(p)
-                QApplication.processEvents()
-
-            if self.mode.currentIndex() == 0:
-                summary = core.predict(
-                    "period", model, out_dir, period=self.period.currentText(),
-                    mosaic_dir=self.mosaic_dir[1].text().strip(),
-                    aoi_bbox=self._aoi_bbox(), progress=progress)
-            else:
-                summary = core.predict(
-                    "files", model, out_dir, t1_path=self.t1[1].text().strip(),
-                    t2_path=self.t2[1].text().strip(),
-                    band_idx=tuple(sp.value() for sp in self.b_spins),
-                    aoi_bbox=self._aoi_bbox(), progress=progress)
+            summary = core.predict(self._mode(), model, out_dir, progress=self._progress(), **self._params())
             self._load_results(summary)
             self.status.setText(
-                f"Готово. Клеток: {summary.get('cells', 0)}. Площади (га): " +
+                f"Готово (маска: {summary.get('used_mask') or 'пересчитана'}). "
+                f"Клеток: {summary.get('cells', 0)}. Площади (га): " +
                 ", ".join(f"{k}={v:.1f}" for k, v in summary["areas_ha"].items()))
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Ошибка", f"{exc}\n\n{traceback.format_exc()}")
+            self.status.setText("Ошибка: " + str(exc))
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _run_all(self):
+        model = self.model[1].text().strip()
+        out_dir = self.out[1].text().strip()
+        if not os.path.exists(model):
+            QMessageBox.warning(self, "Ошибка", f"Модель не найдена:\n{model}")
+            return
+        if not out_dir:
+            QMessageBox.warning(self, "Ошибка", "Укажите папку вывода (маски)")
+            return
+        self._save()
+        try:
+            from . import core
+            self.status.setText("Инференс (маска + тип)…")
+            self.bar.setValue(0)
+            QApplication.setOverrideCursor(_WAIT_CURSOR)
+            m = core.compute_mask(self._mode(), out_dir, **self._params())
+            summary = core.predict(self._mode(), model, out_dir, progress=self._progress(), **self._params())
+            self._load_results(summary)
+            self.status.setText(
+                f"Готово. Маска: {m['changed_ha']:.1f} га. Клеток: {summary.get('cells', 0)}. "
+                "Площади (га): " + ", ".join(f"{k}={v:.1f}" for k, v in summary["areas_ha"].items()))
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Ошибка", f"{exc}\n\n{traceback.format_exc()}")
             self.status.setText("Ошибка: " + str(exc))
