@@ -1,12 +1,15 @@
 """Core inference for the Forest Change QGIS plugin (DOFA + CfC fusion, CPU).
 
+TILED pipeline: the AOI is processed in windows (TILE_PX, a multiple of CHIP), so
+only a fragment of each date is held in RAM at a time (bounded ~0.3 GB for 1024 px
+tiles regardless of the raster size).
+
 Change is decided by the ALGORITHM (per-pixel |dNDVI|/|dNBR| gate); the network
 only classifies the TYPE of the changed 32 px (320 m) chips.
 
-Pipeline (two steps, can be run separately):
   1) compute_mask()  - algorithmic change mask only -> mask.tif (1/0/255), no model
-  2) predict()       - type classification of the changed chips; if mask.tif exists
-                       it is reused, otherwise the gate is recomputed
+  2) predict()       - type classification of the changed chips; reuses mask.tif if
+                       present (tiles without changes are skipped without reading)
 
 Model inputs (batch of 32 px chips):
   pre, post : (B, 6, 128, 128) - bands B02,B03,B04,B08,B11,B12, reflectance/10000
@@ -43,6 +46,7 @@ SCALE = 10000.0
 CHANGE_THR = 0.15  # |dNDVI| / |dNBR| threshold of the algorithmic change gate
 CHANGE_FRAC = 0.02 # chip is changed if at least this fraction of pixels changed
 MIN_AREA_HA = 0.0  # drop merged polygons smaller than this (0 = keep all)
+TILE_PX = int(os.environ.get("FC_TILE", "1024"))   # processing window (multiple of CHIP)
 
 
 def pick_providers():
@@ -204,27 +208,9 @@ def band_count(path):
     return n
 
 
-# ---------------------------------------------------------------- loaders
-def _window(gt, W, H, aoi_bbox):
-    if aoi_bbox:
-        xmin, ymin, xmax, ymax = aoi_bbox
-        c0 = max(0, int((xmin - gt[0]) / gt[1]))
-        r0 = max(0, int((ymax - gt[3]) / gt[5]))
-        c1 = min(W, int((xmax - gt[0]) / gt[1]))
-        r1 = min(H, int((ymin - gt[3]) / gt[5]))
-    else:
-        c0, r0, c1, r1 = 0, 0, W, H
-    return c0, r0, c1 - c0, r1 - r0
-
-
-def _load(mode, period=None, mosaic_dir=None, t1_path=None, t2_path=None,
-          band_idx=None, aoi_bbox=None, with_seq=True):
-    """Read the AOI window for both dates (+ the 4-date sequence) and the invalid mask.
-
-    NOTE on memory: everything for the AOI is kept in RAM as float32. A full-mosaic
-    AOI (13903x6819) costs ~379 MB per band array, so 6 bands x 2 dates plus the
-    (4,9,h,w) sequence map can reach tens of GB - restrict the AOI for big rasters.
-    """
+# ---------------------------------------------------------------- tiling
+def _setup(mode, period, mosaic_dir, t1_path, t2_path, aoi_bbox):
+    """Reference grid, AOI window and the list of files to validate."""
     if mode == "period":
         try:
             from . import periods
@@ -239,9 +225,37 @@ def _load(mode, period=None, mosaic_dir=None, t1_path=None, t2_path=None,
         check = [t1_path, t2_path]
     gt, W, H, proj = _grid_from(ref)
     _assert_same_grid(check, ref)
-    c0, r0, w, h = _window(gt, W, H, aoi_bbox)
+    if aoi_bbox:
+        xmin, ymin, xmax, ymax = aoi_bbox
+        c0 = max(0, int((xmin - gt[0]) / gt[1]))
+        r0 = max(0, int((ymax - gt[3]) / gt[5]))
+        c1 = min(W, int((xmax - gt[0]) / gt[1]))
+        r1 = min(H, int((ymin - gt[3]) / gt[5]))
+    else:
+        c0, r0, c1, r1 = 0, 0, W, H
+    return dict(gt=gt, proj=proj, c0=c0, r0=r0, w=c1 - c0, h=r1 - r0,
+                date1=date1, date2=date2)
 
+
+def _tiles(w, h, tile=None):
+    """Windows (x, y, tw, th) inside the AOI, aligned to the CHIP grid."""
+    tile = max(CHIP, (tile or TILE_PX) // CHIP * CHIP)
+    out = []
+    for y in range(0, h, tile):
+        for x in range(0, w, tile):
+            out.append((x, y, min(tile, w - x), min(tile, h - y)))
+    return out
+
+
+def _read_tile(mode, period, mosaic_dir, t1_path, t2_path, band_idx, c0, r0, w, h,
+               invalid_ok=True, with_seq=True):
+    """Read one window of both dates (+ the 4-date feature stack) and the invalid mask."""
     if mode == "period":
+        try:
+            from . import periods
+        except Exception:
+            import periods
+        date1, date2 = periods.PERIOD_DATES[period]
         A = _read_mosaic6(mosaic_dir, date1, c0, r0, w, h)
         B = _read_mosaic6(mosaic_dir, date2, c0, r0, w, h)
         if with_seq:
@@ -254,6 +268,13 @@ def _load(mode, period=None, mosaic_dir=None, t1_path=None, t2_path=None,
             seq_map = np.stack(feats)                        # (4,9,h,w)
         else:
             seq_map = None
+        invalid = None
+        if invalid_ok:
+            invalid = (A[3] == 0) | (B[3] == 0)
+            for date in (date1, date2):
+                p = os.path.join(mosaic_dir, f"{date}_SCL.tif")
+                if os.path.exists(p):
+                    invalid |= np.isin(_read_band1(p, c0, r0, w, h), SCL_INVALID)
     else:
         idx = band_idx or (1, 2, 3, 4, 5, 6)
         A = _read_stack(t1_path, idx, c0, r0, w, h)
@@ -264,16 +285,8 @@ def _load(mode, period=None, mosaic_dir=None, t1_path=None, t2_path=None,
             seq_map = np.stack([f1, f2, np.zeros_like(f1), np.zeros_like(f1)])
         else:
             seq_map = None
-
-    invalid = np.zeros((h, w), dtype=bool)
-    invalid |= (A[3] == 0) | (B[3] == 0)                     # B08 nodata
-    if mode == "period":
-        for date in (date1, date2):
-            p = os.path.join(mosaic_dir, f"{date}_SCL.tif")
-            if os.path.exists(p):
-                invalid |= np.isin(_read_band1(p, c0, r0, w, h), SCL_INVALID)
-    return dict(A=A, B=B, seq_map=seq_map, invalid=invalid, gt=gt, proj=proj,
-                c0=c0, r0=r0, w=w, h=h, date1=date1, date2=date2)
+        invalid = ((A[3] == 0) | (B[3] == 0)) if invalid_ok else None
+    return A, B, seq_map, invalid
 
 
 def _gate(A, B, invalid, thr=None):
@@ -281,7 +294,8 @@ def _gate(A, B, invalid, thr=None):
     thr = CHANGE_THR if thr is None else thr
     fa = _features9(A)
     fb = _features9(B)
-    return ((np.abs(fb[6] - fa[6]) > thr) | (np.abs(fb[7] - fa[7]) > thr)) & ~invalid
+    g = (np.abs(fb[6] - fa[6]) > thr) | (np.abs(fb[7] - fa[7]) > thr)
+    return g & ~invalid if invalid is not None else g
 
 
 # ---------------------------------------------------------------- step 1: mask
@@ -289,63 +303,60 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, t1_path=None, t2_p
                  band_idx=None, aoi_bbox=None, progress=None, thr=None):
     """Algorithmic change mask only (no neural network) -> mask.tif (1 changed / 0 / 255)."""
     os.makedirs(out_dir, exist_ok=True)
+    s = _setup(mode, period, mosaic_dir, t1_path, t2_path, aoi_bbox)
+    path = os.path.join(out_dir, "mask.tif")
+    ds = _create_raster(path, s["gt"], s["c0"], s["r0"], s["w"], s["h"], s["proj"])
+    band = ds.GetRasterBand(1)
+    tiles = _tiles(s["w"], s["h"])
+    changed = 0
+    invalid_px = 0
     if progress:
         progress(1)
-    d = _load(mode, period, mosaic_dir, t1_path, t2_path, band_idx, aoi_bbox, with_seq=False)
-    if progress:
-        progress(50)
-    change_px = _gate(d["A"], d["B"], d["invalid"], thr)
-    mask = np.zeros((d["h"], d["w"]), np.uint8)
-    mask[change_px] = 1
-    mask[d["invalid"]] = 255
-    path = os.path.join(out_dir, "mask.tif")
-    _write_raster(path, mask, d["gt"], d["c0"], d["r0"], d["w"], d["h"], d["proj"], nodata=255)
-    px_area = d["gt"][1] * abs(d["gt"][5]) / 1e4
+    for i, (x, y, tw, th) in enumerate(tiles):
+        A, B, _, invalid = _read_tile(mode, period, mosaic_dir, t1_path, t2_path, band_idx,
+                                      s["c0"] + x, s["r0"] + y, tw, th, with_seq=False)
+        change = _gate(A, B, invalid, thr)
+        out = np.zeros((th, tw), np.uint8)
+        out[change] = 1
+        out[invalid] = 255
+        band.WriteArray(out, x, y)
+        changed += int(change.sum())
+        invalid_px += int(invalid.sum())
+        if progress:
+            progress(int(100 * (i + 1) / len(tiles)))
+    band = None
+    ds = None
+    px_area = s["gt"][1] * abs(s["gt"][5]) / 1e4
     summary = {"mode": mode, "period": period, "thr": CHANGE_THR if thr is None else thr,
-               "changed_px": int(change_px.sum()), "invalid_px": int(d["invalid"].sum()),
-               "changed_ha": float(change_px.sum() * px_area),
-               "mask_tif": path}
+               "tile_px": TILE_PX, "tiles": len(tiles),
+               "changed_px": changed, "invalid_px": invalid_px,
+               "changed_ha": float(changed * px_area), "mask_tif": path}
     with open(os.path.join(out_dir, "mask_summary.json"), "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2, ensure_ascii=False)
-    if progress:
-        progress(100)
     return summary
 
 
 # ---------------------------------------------------------------- step 2: types
 def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, t1_path=None,
             t2_path=None, band_idx=None, aoi_bbox=None, progress=None, mask_path=None):
-    """Type classification of the changed chips (uses mask.tif if given/exists)."""
+    """Type classification of the changed chips (tiles without changes are skipped)."""
     os.makedirs(out_dir, exist_ok=True)
-    if progress:
-        progress(1)
-    d = _load(mode, period, mosaic_dir, t1_path, t2_path, band_idx, aoi_bbox, with_seq=True)
-    gt, proj, c0, r0, w, h = d["gt"], d["proj"], d["c0"], d["r0"], d["w"], d["h"]
-    A, B, seq_map, invalid = d["A"], d["B"], d["seq_map"], d["invalid"]
+    s = _setup(mode, period, mosaic_dir, t1_path, t2_path, aoi_bbox)
+    gt, proj, c0, r0, w, h = s["gt"], s["proj"], s["c0"], s["r0"], s["w"], s["h"]
+    cls_path = os.path.join(out_dir, "classes.tif")
+    ds_out = _create_raster(cls_path, gt, c0, r0, w, h, proj)
+    band = ds_out.GetRasterBand(1)
 
     mask_file = mask_path or os.path.join(out_dir, "mask.tif")
-    if os.path.exists(mask_file):
-        try:
-            change_px = _read_band1(mask_file, c0, r0, w, h) == 1
-            change_px &= ~invalid
-        except Exception:
-            change_px = _gate(A, B, invalid)
-    else:
-        change_px = _gate(A, B, invalid)
-    if progress:
-        progress(5)
-
+    use_mask = os.path.exists(mask_file)
     model = Model(model_path)
-    cls = np.zeros((h, w), dtype=np.uint8)
-    coords = [(r, c) for r in range(0, h - CHIP + 1, CHIP) for c in range(0, w - CHIP + 1, CHIP)]
-    if not coords:
-        coords = [(max(0, h - CHIP), max(0, w - CHIP))]
-    cells = []                                            # (row, col, cls, conf)
-
+    cells = []
+    tiles = _tiles(w, h)
+    if progress:
+        progress(1)
     buf_a, buf_b, buf_s, buf_pos = [], [], [], []
 
     def flush():
-        """Run the network on the pending chips and record classes/cells."""
         if not buf_a:
             return
         logits = model.run(np.stack(buf_a).astype(np.float32),
@@ -355,59 +366,83 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, t1_path=Non
         for idx_cell, (rr, cc) in enumerate(buf_pos):
             k = int(logits[idx_cell].argmax())
             if k == 0:      # network says "no change" but the gate says changed:
-                k = 1 + int(np.argmax(logits[idx_cell, 1:]))   # take the best type
-            conf = float(probs[idx_cell, k])
-            cls[rr:rr + CHIP, cc:cc + CHIP] = k
-            cells.append((rr, cc, k, conf))
+                k = 1 + int(np.argmax(logits[idx_cell, 1:]))
+            cells.append((rr, cc, k, float(probs[idx_cell, k])))
         buf_a.clear(); buf_b.clear(); buf_s.clear(); buf_pos.clear()
 
-    for i, (r, c) in enumerate(coords):
-        chip_a = A[:, r:r + CHIP, c:c + CHIP]
-        chip_b = B[:, r:r + CHIP, c:c + CHIP]
-        if chip_a.shape[1] < CHIP or chip_a.shape[2] < CHIP:
-            continue
-        frac = float(change_px[r:r + CHIP, c:c + CHIP].mean())
-        if frac < CHANGE_FRAC:
-            cls[r:r + CHIP, c:c + CHIP] = 0
-            if progress and (i % 25 == 0 or i == len(coords) - 1):
-                progress(int(100 * (i + 1) / len(coords)))
-            continue
-        buf_a.append(_resize_bilinear(chip_a, SIZE) / SCALE)
-        buf_b.append(_resize_bilinear(chip_b, SIZE) / SCALE)
-        buf_s.append(seq_map[:, :, r:r + CHIP, c:c + CHIP].mean(axis=(2, 3)))   # (4,9)
-        buf_pos.append((r, c))
-        if len(buf_a) >= BATCH:
-            flush()
-        if progress and (i % 25 == 0 or i == len(coords) - 1):
-            progress(int(100 * (i + 1) / len(coords)))
-    flush()                                                   # do not lose the tail
-    cls[invalid] = 255
+    for ti, (x, y, tw, th) in enumerate(tiles):
+        out = np.zeros((th, tw), np.uint8)
+        if use_mask:
+            # read only the mask for this window: tiles without changes cost nothing
+            mt = _read_band1(mask_file, c0 + x, r0 + y, tw, th)
+            change = mt == 1
+            if not change.any():
+                band.WriteArray(out, x, y)
+                if progress:
+                    progress(int(100 * (ti + 1) / len(tiles)))
+                continue
+            A, B, seq_map, invalid = _read_tile(mode, period, mosaic_dir, t1_path, t2_path,
+                                                band_idx, c0 + x, r0 + y, tw, th, with_seq=True)
+            change &= ~invalid
+        else:
+            A, B, seq_map, invalid = _read_tile(mode, period, mosaic_dir, t1_path, t2_path,
+                                                band_idx, c0 + x, r0 + y, tw, th, with_seq=True)
+            change = _gate(A, B, invalid)
 
-    cls_path = os.path.join(out_dir, "classes.tif")
-    _write_raster(cls_path, cls, gt, c0, r0, w, h, proj, nodata=255)
+        coords = [(r, c) for r in range(0, th - CHIP + 1, CHIP)
+                  for c in range(0, tw - CHIP + 1, CHIP)]
+        n_before = len(cells)
+        for r, c in coords:
+            frac = float(change[r:r + CHIP, c:c + CHIP].mean())
+            if frac < CHANGE_FRAC:
+                continue
+            chip_a = A[:, r:r + CHIP, c:c + CHIP]
+            chip_b = B[:, r:r + CHIP, c:c + CHIP]
+            if chip_a.shape[1] < CHIP or chip_a.shape[2] < CHIP:
+                continue
+            buf_a.append(_resize_bilinear(chip_a, SIZE) / SCALE)
+            buf_b.append(_resize_bilinear(chip_b, SIZE) / SCALE)
+            buf_s.append(seq_map[:, :, r:r + CHIP, c:c + CHIP].mean(axis=(2, 3)))
+            buf_pos.append((y + r, x + c))
+            if len(buf_a) >= BATCH:
+                flush()
+        flush()
+        # write the classes of the cells found in this tile
+        for (rr, cc, k, _conf) in cells[n_before:]:
+            out[rr - y:rr - y + CHIP, cc - x:cc - x + CHIP] = k
+        out[invalid] = 255
+        band.WriteArray(out, x, y)
+        if progress:
+            progress(int(100 * (ti + 1) / len(tiles)))
+    band = None
+    ds_out = None
+
     gpkg = os.path.join(out_dir, "changes.gpkg")
     _polygonize(cls_path, gpkg, proj)
     cells_path = os.path.join(out_dir, "cells.gpkg")
-    _write_cells(cells_path, cells, gt, c0, r0, proj, period, d["date1"], d["date2"])
+    _write_cells(cells_path, cells, gt, c0, r0, proj, period, s["date1"], s["date2"])
+    n_px = {}
+    for k in (1, 2, 3):
+        n_px[CLASSES[k]] = float(sum(1 for _, _, kk, _ in cells if kk == k) * CHIP * CHIP
+                                 * gt[1] * abs(gt[5]) / 1e4)
     summary = {"mode": mode, "period": period, "provider": model.provider,
-               "chip": CHIP, "scale_m": gt[1], "change_thr": CHANGE_THR,
-               "cells": len(cells), "used_mask": os.path.basename(mask_file) if os.path.exists(mask_file) else None,
-               "areas_ha": {CLASSES[k]: float((cls == k).sum() * gt[1] * abs(gt[5]) / 1e4) for k in (1, 2, 3)},
+               "chip": CHIP, "tile_px": TILE_PX, "scale_m": gt[1], "change_thr": CHANGE_THR,
+               "cells": len(cells),
+               "used_mask": os.path.basename(mask_file) if use_mask else None,
+               "areas_ha": n_px,
                "classes_tif": cls_path, "changes_gpkg": gpkg, "cells_gpkg": cells_path}
     with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2, ensure_ascii=False)
     return summary
 
 
-def _write_raster(path, arr, gt, c0, r0, w, h, proj, nodata=255):
+def _create_raster(path, gt, c0, r0, w, h, proj, nodata=255):
     drv = gdal.GetDriverByName("GTiff")
     ds = drv.Create(path, w, h, 1, gdal.GDT_Byte, options=["COMPRESS=DEFLATE", "TILED=YES"])
     ds.SetGeoTransform((gt[0] + c0 * gt[1], gt[1], 0, gt[3] + r0 * gt[5], 0, gt[5]))
     ds.SetProjection(proj)
-    band = ds.GetRasterBand(1)
-    band.SetNoDataValue(nodata)
-    band.WriteArray(arr)
-    ds = None
+    ds.GetRasterBand(1).SetNoDataValue(nodata)
+    return ds
 
 
 def _write_cells(path, cells, gt, c0, r0, proj, period, date1, date2):
