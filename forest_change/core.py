@@ -1,14 +1,19 @@
-"""Core inference for the Forest Change QGIS plugin (DOFA, CPU).
+"""Core inference for the Forest Change QGIS plugin (DOFA + CfC fusion, CPU).
 
-Runs a siamese DOFA ONNX classifier over bi-temporal Sentinel-2 tiles using
-onnxruntime (CPU by default; DirectML/CUDA/ROCm used if available) and GDAL for I/O.
+Runs a siamese DOFA + CfC logit-stack fusion ONNX model over bi-temporal
+Sentinel-2 tiles using onnxruntime (CPU by default; GPU providers if available)
+and GDAL for I/O.
 
-Model: 6 bands B02,B03,B04,B08,B11,B12 (reflectance/10000), 32 px chips (320 m)
-upscaled to 128 px; outputs 4 classes: no_change / logging / windfall / fire.
+Model inputs (batch of 32 px chips = 320 m):
+  pre, post : (B, 6, 128, 128) - bands B02,B03,B04,B08,B11,B12, reflectance/10000
+  seq       : (B, 4, 9)        - 9 features (6 bands + NDVI/NBR/NDMI) for the four
+                                 canonical dates, mean-pooled over the chip
+Output: 4 logits - no_change / logging / windfall / fire
 
 Two input modes:
   period  - mosaics stored as <date>_<band>.tif (+ <date>_SCL.tif) in a folder
   files   - two multi-band GeoTIFFs (T1, T2) with 6 selected band numbers
+            (seq then uses only these two dates, remaining slots are zeros)
 
 Outputs in out_dir: classes.tif, changes.gpkg, summary.json
 """
@@ -23,6 +28,7 @@ gdal.UseExceptions()
 
 CLASSES = {0: "no_change", 1: "logging", 2: "windfall", 3: "fire"}
 BANDS6 = ("B02", "B03", "B04", "B08", "B11", "B12")
+SEQ_DATES = ("2023-09", "2024-05", "2025-07", "2026-06")
 SCL_INVALID = [0, 1, 3, 8, 9, 10, 11]
 PROVIDER_ORDER = ["DmlExecutionProvider", "CUDAExecutionProvider", "ROCMExecutionProvider",
                   "CoreMLExecutionProvider", "CPUExecutionProvider"]
@@ -30,6 +36,8 @@ CHIP = 32          # 320 m at 10 m resolution (same scale as the training chips)
 SIZE = 128         # model input
 BATCH = 64
 SCALE = 10000.0
+CHANGE_THR = 0.15  # |dNDVI| / |dNBR| threshold of the algorithmic change gate
+CHANGE_FRAC = 0.10 # chip is 'changed' if at least this fraction of pixels changed
 
 
 def pick_providers():
@@ -49,6 +57,16 @@ def _resize_bilinear(a, size):
     return tmp[:, y0, :] * (1 - wy) + tmp[:, y1, :] * wy
 
 
+def _features9(bands):
+    """bands: (6,h,w) reflectance (0..10000) -> (9,h,w) features."""
+    b = bands.astype(np.float32) / SCALE
+    b02, b03, b04, b08, b11, b12 = b
+    ndvi = (b08 - b04) / np.maximum(b08 + b04, 1e-6)
+    nbr = (b08 - b12) / np.maximum(b08 + b12, 1e-6)
+    ndmi = (b08 - b11) / np.maximum(b08 + b11, 1e-6)
+    return np.stack([b02, b03, b04, b08, b11, b12, ndvi, nbr, ndmi])
+
+
 class Model:
     def __init__(self, path):
         import onnxruntime as ort
@@ -59,14 +77,14 @@ class Model:
             self.sess = ort.InferenceSession(buf, providers=providers)
         except Exception:
             self.sess = ort.InferenceSession(buf, providers=["CPUExecutionProvider"])
+        self.names = [i.name for i in self.sess.get_inputs()]
 
     @property
     def provider(self):
         return self.sess.get_providers()[0]
 
-    def run(self, pre, post):
-        out = self.sess.run(None, {"pre": pre, "post": post})[0]
-        return out  # (B, 4)
+    def run(self, pre, post, seq):
+        return self.sess.run(None, {"pre": pre, "post": post, "seq": seq})[0]
 
 
 # ---------------------------------------------------------------- IO helpers
@@ -91,7 +109,6 @@ def _read_band1(path, c0, r0, w, h):
 
 
 def _read_stack(path, band_idx, c0, r0, w, h):
-    """6 bands from a multi-band GeoTIFF -> (6,h,w) float32."""
     ds = _gdal_open(path)
     out = np.zeros((len(band_idx), h, w), dtype=np.float32)
     for i, b in enumerate(band_idx):
@@ -101,11 +118,9 @@ def _read_stack(path, band_idx, c0, r0, w, h):
 
 
 def _read_mosaic6(mosaic_dir, date, c0, r0, w, h):
-    """6 bands from <date>_<band>.tif -> (6,h,w) float32."""
     out = np.zeros((6, h, w), dtype=np.float32)
     for i, b in enumerate(BANDS6):
-        p = os.path.join(mosaic_dir, f"{date}_{b}.tif")
-        ds = _gdal_open(p)
+        ds = _gdal_open(os.path.join(mosaic_dir, f"{date}_{b}.tif"))
         out[i] = ds.GetRasterBand(1).ReadAsArray(c0, r0, w, h)
         del ds
     return out
@@ -142,19 +157,35 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, t1_path=Non
     if mode == "period":
         A = _read_mosaic6(mosaic_dir, date1, c0, r0, w, h)
         B = _read_mosaic6(mosaic_dir, date2, c0, r0, w, h)
+        feats = []
+        for date in SEQ_DATES:
+            try:
+                feats.append(_features9(_read_mosaic6(mosaic_dir, date, c0, r0, w, h)))
+            except Exception:
+                feats.append(np.zeros((9, h, w), np.float32))
+        seq_map = np.stack(feats)                        # (4,9,h,w)
     else:
         idx = band_idx or (1, 2, 3, 4, 5, 6)
         A = _read_stack(t1_path, idx, c0, r0, w, h)
         B = _read_stack(t2_path, idx, c0, r0, w, h)
+        f1 = _features9(A)
+        f2 = _features9(B)
+        zero = np.zeros_like(f1)
+        seq_map = np.stack([f1, f2, zero, zero])         # 2 dates only
 
     invalid = np.zeros((h, w), dtype=bool)
-    invalid |= (A[3] == 0) | (B[3] == 0)          # B08 nodata
+    invalid |= (A[3] == 0) | (B[3] == 0)                 # B08 nodata
     if mode == "period":
         for date in (date1, date2):
             p = os.path.join(mosaic_dir, f"{date}_SCL.tif")
             if os.path.exists(p):
-                scl = _read_band1(p, c0, r0, w, h)
-                invalid |= np.isin(scl, SCL_INVALID)
+                invalid |= np.isin(_read_band1(p, c0, r0, w, h), SCL_INVALID)
+
+    # algorithmic change mask (per pixel): |dNDVI| or |dNBR| above the threshold
+    fa_map = _features9(A)
+    fb_map = _features9(B)
+    change_px = (np.abs(fb_map[6] - fa_map[6]) > CHANGE_THR) | (np.abs(fb_map[7] - fa_map[7]) > CHANGE_THR)
+    change_px &= ~invalid
 
     model = Model(model_path)
     cls = np.zeros((h, w), dtype=np.uint8)
@@ -162,20 +193,34 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, t1_path=Non
     if not coords:
         coords = [(max(0, h - CHIP), max(0, w - CHIP))]
 
-    buf_a, buf_b, buf_pos = [], [], []
+    buf_a, buf_b, buf_s, buf_pos = [], [], [], []
     for i, (r, c) in enumerate(coords):
-        a = A[:, r:r + CHIP, c:c + CHIP]
-        b = B[:, r:r + CHIP, c:c + CHIP]
-        if a.shape[1] < CHIP or a.shape[2] < CHIP:
+        chip_a = A[:, r:r + CHIP, c:c + CHIP]
+        chip_b = B[:, r:r + CHIP, c:c + CHIP]
+        if chip_a.shape[1] < CHIP or chip_a.shape[2] < CHIP:
             continue
-        buf_a.append(_resize_bilinear(a, SIZE) / SCALE)
-        buf_b.append(_resize_bilinear(b, SIZE) / SCALE)
+        # change is decided by the algorithm (per-pixel mask), the network only
+        # classifies the type among chips that contain enough changed pixels
+        frac = float(change_px[r:r + CHIP, c:c + CHIP].mean())
+        if frac < CHANGE_FRAC:
+            cls[r:r + CHIP, c:c + CHIP] = 0
+            if progress and (i % 25 == 0 or i == len(coords) - 1):
+                progress(int(100 * (i + 1) / len(coords)))
+            continue
+        buf_a.append(_resize_bilinear(chip_a, SIZE) / SCALE)
+        buf_b.append(_resize_bilinear(chip_b, SIZE) / SCALE)
+        buf_s.append(seq_map[:, :, r:r + CHIP, c:c + CHIP].mean(axis=(2, 3)))   # (4,9)
         buf_pos.append((r, c))
         if len(buf_a) >= BATCH or i == len(coords) - 1:
-            logits = model.run(np.stack(buf_a).astype(np.float32), np.stack(buf_b).astype(np.float32))
+            logits = model.run(np.stack(buf_a).astype(np.float32),
+                               np.stack(buf_b).astype(np.float32),
+                               np.stack(buf_s).astype(np.float32))
             for (rr, cc), k in zip(buf_pos, logits.argmax(1)):
-                cls[rr:rr + CHIP, cc:cc + CHIP] = int(k)
-            buf_a, buf_b, buf_pos = [], [], []
+                k = int(k)
+                if k == 0:      # network says "no change" but the gate says changed:
+                    k = 1 + int(np.argmax(logits[0, 1:]))   # take the best type
+                cls[rr:rr + CHIP, cc:cc + CHIP] = k
+            buf_a, buf_b, buf_s, buf_pos = [], [], [], []
         if progress and (i % 25 == 0 or i == len(coords) - 1):
             progress(int(100 * (i + 1) / len(coords)))
     cls[invalid] = 255
