@@ -350,6 +350,7 @@ class ForestChangeDialog(QDialog):
             rl = QgsRasterLayer(summary["mask_tif"], "Маска изменений")
             if rl.isValid():
                 QgsProject.instance().addMapLayer(rl)
+                self._style_mask(rl)
                 if self.auto_apply.isChecked():
                     self.iface.mapCanvas().setExtent(rl.extent())
                     self.iface.mapCanvas().refresh()
@@ -419,13 +420,10 @@ class ForestChangeDialog(QDialog):
     # --------------------------------------------------------- results
     def _load_results(self, summary):
         project = QgsProject.instance()
-        rl = QgsRasterLayer(summary["classes_tif"], "Изменения: классы")
+        rl = QgsRasterLayer(summary["classes_tif"], "Изменения: типы (классы)")
         if rl.isValid():
-            try:
-                rl.setOpacity(0.75)
-            except Exception:
-                pass
             project.addMapLayer(rl)
+            self._style_classes(rl)
         vl = QgsVectorLayer(summary["changes_gpkg"], "Изменения: контуры", "ogr")
         if vl.isValid():
             project.addMapLayer(vl)
@@ -455,3 +453,29 @@ class ForestChangeDialog(QDialog):
             cats.append(QgsRendererCategory(name, sym, name))
         layer.setRenderer(QgsCategorizedSymbolRenderer("type", cats))
         layer.triggerRepaint()
+
+    @staticmethod
+    def _paletted(layer, entries):
+        """entries: list of (value, QColor, label) -> paletted renderer (byte rasters)."""
+        from qgis.core import QgsPalettedRasterRenderer
+        classes = [QgsPalettedRasterRenderer.Class(v, c, lbl) for v, c, lbl in entries]
+        layer.setRenderer(QgsPalettedRasterRenderer(layer.dataProvider(), 1, classes))
+        layer.triggerRepaint()
+
+    def _style_mask(self, layer):
+        """1 = red (change), 0 and 255 = fully transparent."""
+        trans = QColor(0, 0, 0, 0)
+        self._paletted(layer, [(0, trans, "нет изменений"),
+                               (1, QColor(255, 0, 0, 255), "изменение"),
+                               (255, trans, "nodata")])
+        layer.setOpacity(1.0)
+
+    def _style_classes(self, layer):
+        """Types colored, no_change/nodata fully transparent."""
+        trans = QColor(0, 0, 0, 0)
+        self._paletted(layer, [(0, trans, "нет изменений"),
+                               (1, QColor(255, 0, 0, 255), "logging"),
+                               (2, QColor(255, 215, 0, 255), "windfall"),
+                               (3, QColor(255, 0, 255, 255), "fire"),
+                               (255, trans, "nodata")])
+        layer.setOpacity(1.0)
