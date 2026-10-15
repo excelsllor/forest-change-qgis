@@ -31,23 +31,45 @@ Sentinel-2. **Наличие изменения определяет алгор�
 
 Требуется QGIS 3.16+ (проверено на 3.44 LTR, Python 3.12).
 
-**Вариант A — из ZIP:** QGIS → *Модули → Управление модулями → Установить из ZIP*.
+**Вариант A — из ZIP (рекомендуется):**
+1. скачайте `forest_change_plugin_v0.4.0.zip` из
+   [Releases плагина](https://github.com/excelsllor/forest-change-qgis/releases);
+2. QGIS → *Модули → Управление модулями → Установить из ZIP* → выберите файл;
+3. включите модуль «Forest Change Detection (DOFA+CfC)».
 
 **Вариант B — вручную:** скопировать папку `forest_change` в
 `%APPDATA%\QGIS\QGIS3\profiles\default\python\plugins\` и включить модуль.
 
-Зависимость (CPU-инференс):
+**Зависимости (один раз):**
 
 ```powershell
-<OSGeo4W>\apps\Python312\python.exe -m pip install onnxruntime
+# Python из OSGeo4W (тот, что использует QGIS)
+C:\Users\<user>\AppData\Local\Programs\OSGeo4W\apps\Python312\python.exe -m pip install onnxruntime
+# опционально GPU: -m pip install onnxruntime-directml
 ```
 
-## Модель
+**Модель** (в ZIP не входит, 426 МБ): скачайте `forest_change_fusion128.onnx` из
+[Releases моделей](https://github.com/excelsllor/forest-change-model/releases)
+и положите в `forest_change/model/` рядом с `forest_change_fusion128.json`.
 
-Модель **не входит в репозиторий** (426 МБ, лимит GitHub — 100 МБ на файл).
-Скачайте `forest_change_fusion128.onnx` из репозитория с моделями
-[`forest-change-model` → Releases](https://github.com/excelsllor/forest-change-model/releases)
-и положите в `forest_change/model/` (рядом — `forest_change_fusion128.json`).
+## Как проверить
+
+1. Откройте QGIS, включите модуль → панель **Forest Change**.
+2. Режим **«Готовые периоды»**: укажите папку мозаик (файлы `<дата>_<band>.tif`
+   для 6 каналов B02/B03/B04/B08/B11/B12 и `<дата>_SCL.tif`), период
+   (`2025-07 -> 2026-06`), при желании AOI (векторный слой), папку вывода и
+   путь к ONNX → **«Выявить изменения»**. Либо режим **«Свои снимки»** (T1/T2, 6 каналов).
+3. По завершении в панели — число клеток и площади (га); на карту добавляются
+   `classes` (растр), `polygons` (слитые контуры) и **`cells 320 m`** (клетки).
+4. **Проверка клеток**: инструмент *Identify* → клик по клетке → атрибуты
+   `x_center`, `y_center` (EPSG:32637), `type`, `conf`, `period`, `date1`, `date2`.
+5. Файлы в папке вывода: `classes.tif`, `changes.gpkg`, `cells.gpkg`, `summary.json`.
+
+**Ориентир (проверено на наборе, квартал q913, 2025-07→2026-06):** 28 клеток,
+286.7 га вырубки, conf 0.90–0.99, recall вырубки 0.99.
+
+**Если в логе появилось `provider ... failed, falling back to CPUExecutionProvider`** —
+это норма: DirectML не умеет наш Reshape с батчем, плагин сам переключается на CPU.
 
 ## Точность (Вожегодское лесничество, held-out кварталы)
 

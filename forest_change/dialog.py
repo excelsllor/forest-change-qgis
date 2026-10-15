@@ -147,7 +147,7 @@ class ForestChangeDialog(QDialog):
                     aoi_bbox=self._aoi_bbox(), progress=progress)
             self._load_results(summary)
             self.status.setText(
-                "Готово. Площади (га): " +
+                f"Готово. Клеток: {summary.get('cells', 0)}. Площади (га): " +
                 ", ".join(f"{k}={v:.1f}" for k, v in summary["areas_ha"].items()))
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Ошибка", f"{exc}\n\n{traceback.format_exc()}")
@@ -164,6 +164,12 @@ class ForestChangeDialog(QDialog):
         if vl.isValid():
             project.addMapLayer(vl)
             self._style_vector(vl)
+        cells = summary.get("cells_gpkg")
+        if cells and os.path.exists(cells):
+            cl = QgsVectorLayer(cells, "Forest changes (cells 320 m)", "ogr")
+            if cl.isValid():
+                project.addMapLayer(cl)
+                self._style_vector(cl)
         self.iface.mapCanvas().refresh()
 
     def _style_vector(self, layer):
