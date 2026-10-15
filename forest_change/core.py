@@ -27,6 +27,7 @@ Outputs in out_dir: mask.tif, classes.tif, changes.gpkg, cells.gpkg, summary.jso
 
 import json
 import os
+import time
 
 import numpy as np
 from osgeo import gdal, ogr, osr
@@ -36,7 +37,9 @@ gdal.UseExceptions()
 CLASSES = {0: "no_change", 1: "logging", 2: "windfall", 3: "fire"}
 BANDS6 = ("B02", "B03", "B04", "B08", "B11", "B12")
 SEQ_DATES = ("2023-09", "2024-05", "2025-07", "2026-06")
-SCL_INVALID = [0, 1, 3, 8, 9, 10, 11]
+SCL_INVALID = [0, 1, 3, 5, 6, 8, 9, 10, 11]   # + 5 not-vegetated (urban/bare), 6 water
+FOREST_NDVI_MIN = 0.3      # a pixel must be vegetated (NDVI >= min) on at least one date
+                           # to be considered forest (filters urban/bare/cropland leftovers)
 PROVIDER_ORDER = ["DmlExecutionProvider", "CUDAExecutionProvider", "ROCMExecutionProvider",
                   "CoreMLExecutionProvider", "CPUExecutionProvider"]
 PROVIDER_MAP = {
@@ -79,6 +82,13 @@ def _resize_bilinear(a, size):
     y0 = np.floor(yi).astype(int); y1 = np.minimum(y0 + 1, H - 1); wy = (yi - y0)[None, :, None]
     tmp = a[:, :, x0] * (1 - wx) + a[:, :, x1] * wx
     return tmp[:, y0, :] * (1 - wy) + tmp[:, y1, :] * wy
+
+
+def _ndvi(bands):
+    """NDVI from a (6,h,w) reflectance window (band order B02,B03,B04,B08,B11,B12)."""
+    b04 = bands[2].astype(np.float32)
+    b08 = bands[3].astype(np.float32)
+    return (b08 - b04) / np.maximum(b08 + b04, 1e-6)
 
 
 def _features9(bands):
@@ -128,6 +138,97 @@ class Model:
             self.sess = self._ort.InferenceSession(self._buf, providers=["CPUExecutionProvider"])
             self._cpu_only = True
             return self._infer()
+
+
+ROCM_PY = os.environ.get("FC_ROCM_PY",
+                         r"D:\comfyui\Data\Packages\ComfyUI\venv\Scripts\python.exe")
+ROCM_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rocm_worker.py")
+
+
+class RocmModel:
+    """GPU inference via a persistent torch/ROCm worker subprocess (AMD on Windows)."""
+
+    def __init__(self, model_path, out_dir, timeout=900):
+        import subprocess
+        if not os.path.exists(ROCM_PY):
+            raise FileNotFoundError(f"ROCm python not found: {ROCM_PY}")
+        if not os.path.exists(ROCM_WORKER):
+            raise FileNotFoundError(f"worker not found: {ROCM_WORKER}")
+        self._model_path = model_path
+        self._cpu = None
+        self._io = os.path.join(out_dir, "_rocm_io.npz")
+        self._proc = subprocess.Popen(
+            [ROCM_PY, ROCM_WORKER], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+            cwd=os.path.dirname(ROCM_WORKER))
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            line = self._proc.stdout.readline()
+            if not line:
+                raise RuntimeError("ROCm-воркер завершился при загрузке модели")
+            if line.startswith("READY"):
+                name = line.split("name=")[-1].strip() if "name=" in line else "GPU"
+                self._device = f"ROCm (torch, {name})"
+                break
+            print(f"[forest_change] rocm: {line.strip()}", flush=True)
+        else:
+            raise RuntimeError("ROCm-воркер: таймаут загрузки модели")
+        print(f"[forest_change] {self._device}", flush=True)
+
+    @property
+    def provider(self):
+        if self._cpu is not None:
+            return "CPUExecutionProvider (ROCm fallback)"
+        return self._device
+
+    def run(self, pre, post, seq):
+        if self._cpu is not None:
+            return self._cpu.run(pre, post, seq)
+        try:
+            np.savez(self._io, pre=pre.astype(np.float32), post=post.astype(np.float32),
+                     seq=seq.astype(np.float32))
+            self._proc.stdin.write(self._io + "\n")
+            self._proc.stdin.flush()
+            line = self._proc.stdout.readline()
+            if not line.startswith("OK"):
+                raise RuntimeError(f"ROCm-воркер: {line.strip()[:200]}")
+            with np.load(self._io + ".out.npz") as z:
+                return z["logits"]
+        except Exception as exc:  # noqa: BLE001  (GPU hang / driver reset / worker crash)
+            print(f"[forest_change] ROCm-воркер упал ({type(exc).__name__}: {str(exc)[:120]}), "
+                  "перехожу на onnxruntime CPU", flush=True)
+            self.close()
+            self._cpu = Model(self._model_path, "cpu")
+            return self._cpu.run(pre, post, seq)
+
+    def close(self):
+        try:
+            self._proc.stdin.write("exit\n")
+            self._proc.stdin.flush()
+            self._proc.wait(timeout=10)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+        for p in (self._io, self._io + ".out.npz"):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError:
+                pass
+
+
+def _make_model(model_path, provider, out_dir):
+    """ROCm torch worker when requested and available, otherwise onnxruntime."""
+    if str(provider or "").lower() in ("rocm_torch", "torch", "rocm-gpu"):
+        try:
+            return RocmModel(model_path, out_dir)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[forest_change] ROCm-воркер недоступен ({type(exc).__name__}: "
+                  f"{str(exc)[:120]}), использую onnxruntime CPU", flush=True)
+    return Model(model_path, provider)
 
 
 # ---------------------------------------------------------------- IO helpers
@@ -318,6 +419,9 @@ def _read_tile(s, mode, band_idx, c0, r0, w, h, with_seq=True):
         else:
             seq_map = None
         invalid = (A[3] == 0) | (B[3] == 0)
+    # non-forest filter: not vegetated on either date (urban, bare, cropland leftovers)
+    if FOREST_NDVI_MIN > 0:
+        invalid |= (_ndvi(A) < FOREST_NDVI_MIN) & (_ndvi(B) < FOREST_NDVI_MIN)
     return A, B, seq_map, invalid
 
 
@@ -383,7 +487,14 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
 
     mask_file = mask_path or os.path.join(out_dir, "mask.tif")
     use_mask = os.path.exists(mask_file)
-    model = Model(model_path, provider)
+    # the mask may be AOI-sized (written by compute_mask) or cover the whole source
+    # grid: compute the AOI offset inside the mask raster from the geotransforms
+    mask_dx = mask_dy = 0
+    if use_mask:
+        mgt, _, _, _ = _grid_from(mask_file)
+        mask_dx = int(round((gt[0] + c0 * gt[1] - mgt[0]) / gt[1]))
+        mask_dy = int(round((gt[3] + r0 * gt[5] - mgt[3]) / gt[5]))
+    model = _make_model(model_path, provider, out_dir)
     cells = []
     tiles = _tiles(w, h)
     if progress:
@@ -408,7 +519,7 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
         out = np.zeros((th, tw), np.uint8)
         if use_mask:
             # read only the mask for this window: tiles without changes cost nothing
-            mt = _read_band1(mask_file, c0 + x, r0 + y, tw, th)
+            mt = _read_band1(mask_file, mask_dx + x, mask_dy + y, tw, th)
             change = mt == 1
             if not change.any():
                 band.WriteArray(out, x, y)
@@ -450,6 +561,8 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
             progress(int(100 * (ti + 1) / len(tiles)))
     band = None
     ds_out = None
+    if hasattr(model, "close"):
+        model.close()
 
     gpkg = os.path.join(out_dir, "changes.gpkg")
     _polygonize(cls_path, gpkg, proj)

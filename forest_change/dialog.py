@@ -24,7 +24,7 @@ BANDS6 = ("B02", "B03", "B04", "B08", "B11", "B12")
 SETTINGS = "forest_change"
 DATE_RE = re.compile(r"(20\d{2})[-_./]?(\d{2})(?:[-_./]?(\d{2}))?")
 PROVIDERS = [("Авто", "auto"), ("CPU", "cpu"), ("CUDA", "cuda"),
-             ("DirectML", "dml"), ("ROCm", "rocm")]
+             ("DirectML", "dml"), ("ROCm (torch, GPU)", "rocm_torch")]
 
 
 def parse_date(text):

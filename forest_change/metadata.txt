@@ -2,11 +2,11 @@
 name=Forest Change Detection (DOFA+CfC)
 qgisMinimumVersion=3.16
 qgisMaximumVersion=4.99
-description=Algorithmic change detection (NDVI/NBR gate) plus type classification (logging / windfall / fire) of the changed chips with a DOFA+CfC fusion model on CPU (onnxruntime).
-version=0.9.0
+description=Algorithmic change detection (NDVI/NBR gate, SCL + NDVI forest filter) plus type classification (logging / windfall / fire) of the changed chips with a DOFA+CfC fusion model on CPU (onnxruntime) or GPU (ROCm torch worker).
+version=0.10.0
 author=Forest Hackathon Team
 email=team@example.com
-about=Detects forest cover changes between two dates: the change mask is computed algorithmically from the NDVI/NBR difference, and a siamese DOFA + CfC fusion network classifies the type of the changed 32 m chips (320 m cells). Outputs: class raster, merged change polygons and a cells layer (one polygon per changed cell with coordinates, type and confidence). Runs on CPU with onnxruntime (auto-fallback from GPU providers if they fail).
+about=Detects forest cover changes between two dates: the change mask is computed algorithmically from the NDVI/NBR difference (urban/water/bare pixels are excluded via Sentinel-2 SCL and an NDVI vegetation check), and a siamese DOFA + CfC fusion network classifies the type of the changed 32 m chips (320 m cells). Outputs: class raster, merged change polygons and a cells layer (one polygon per changed cell with coordinates, type and confidence). Runs on CPU with onnxruntime (auto-fallback from GPU providers if they fail); on AMD Windows a "ROCm (torch, GPU)" provider runs the model in a persistent PyTorch worker process (~6x faster).
 tracker=https://github.com/excelsllor/forest-change-qgis/issues
 repository=https://github.com/excelsllor/forest-change-qgis
 tags=forest,change detection,dofa,vit,remote sensing
