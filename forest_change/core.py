@@ -147,6 +147,15 @@ def _read_band1(path, c0, r0, w, h):
 
 def _read_stack(path, band_idx, c0, r0, w, h):
     ds = _gdal_open(path)
+    n = ds.RasterCount
+    bad = [b for b in band_idx if b < 1 or b > n]
+    if bad:
+        del ds
+        raise ValueError(
+            f"{os.path.basename(path)}: запрошены каналы {list(band_idx)}, "
+            f"но в файле только {n} канал(ов).\n"
+            "Укажите корректные номера: для 6-канального стека — 1,2,3,4,5,6; "
+            "для Sentinel-2 L2A — 2,3,4,8,11,12 (B02,B03,B04,B08,B11,B12).")
     out = np.zeros((len(band_idx), h, w), dtype=np.float32)
     for i, b in enumerate(band_idx):
         out[i] = ds.GetRasterBand(b).ReadAsArray(c0, r0, w, h)
@@ -154,10 +163,39 @@ def _read_stack(path, band_idx, c0, r0, w, h):
     return out
 
 
+def guess_band_idx(path):
+    """Sensible default band indices for a multi-band raster.
+
+    >= 12 bands -> Sentinel-2 L2A order (B02,B03,B04,B08,B11,B12 = 2,3,4,8,11,12);
+    6..11 bands -> the first six bands; otherwise clamp to the available count.
+    """
+    ds = _gdal_open(path)
+    n = ds.RasterCount
+    del ds
+    if n >= 12:
+        return (2, 3, 4, 8, 11, 12)
+    if n >= 6:
+        return (1, 2, 3, 4, 5, 6)
+    return tuple(min(i, n) for i in (1, 2, 3, 4, 5, 6))
+
+
+def band_count(path):
+    ds = _gdal_open(path)
+    n = ds.RasterCount
+    del ds
+    return n
+
+
 def _read_mosaic6(mosaic_dir, date, c0, r0, w, h):
     out = np.zeros((6, h, w), dtype=np.float32)
     for i, b in enumerate(BANDS6):
-        ds = _gdal_open(os.path.join(mosaic_dir, f"{date}_{b}.tif"))
+        p = os.path.join(mosaic_dir, f"{date}_{b}.tif")
+        if not os.path.exists(p):
+            raise ValueError(
+                f"В папке мозаик нет файла «{os.path.basename(p)}».\n"
+                f"Папка: {mosaic_dir}\nОжидаются файлы <дата>_<канал>.tif для каналов "
+                f"{', '.join(BANDS6)} и <дата>_SCL.tif по датам {', '.join(SEQ_DATES)}.")
+        ds = _gdal_open(p)
         out[i] = ds.GetRasterBand(1).ReadAsArray(c0, r0, w, h)
         del ds
     return out

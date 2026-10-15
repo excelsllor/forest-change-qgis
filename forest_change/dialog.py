@@ -60,6 +60,8 @@ class ForestChangeDialog(QDialog):
         form.addRow("T1 (архив)", self.t1[0])
         self.t2 = self._path_row()
         form.addRow("T2 (текущий)", self.t2[0])
+        self.t1[1].textChanged.connect(self._sync_bands)
+        self.t2[1].textChanged.connect(self._sync_bands)
         self.bands = QHBoxLayout()
         self.b_spins = []
         defaults = (2, 3, 4, 8, 11, 12)
@@ -124,6 +126,7 @@ class ForestChangeDialog(QDialog):
 
     # ------------------------------------------------------- settings
     def _restore(self):
+        self._loading = True
         s = QSettings()
         self.mode.setCurrentIndex(int(s.value(f"{SETTINGS}/mode", 0)))
         self.mosaic_dir[1].setText(s.value(f"{SETTINGS}/mosaic_dir", ""))
@@ -144,7 +147,38 @@ class ForestChangeDialog(QDialog):
         if model:
             self.model[1].setText(model)
         self.auto_apply.setChecked(str(s.value(f"{SETTINGS}/auto_apply", "true")).lower() == "true")
+        # clamp the saved band indices to the real band counts of the files
+        for path in (self.t1[1].text().strip(), self.t2[1].text().strip()):
+            if path and os.path.exists(path):
+                try:
+                    from . import core
+                    n = core.band_count(path)
+                    for sp in self.b_spins:
+                        sp.setRange(1, max(1, n))
+                        if sp.value() > n:
+                            sp.setValue(n)
+                except Exception:
+                    pass
+        self._loading = False
         self._update_mode()
+
+    def _sync_bands(self, *args):
+        """Auto-pick band indices for the chosen file (S2 L2A order for >=12 bands)."""
+        if getattr(self, "_loading", False):
+            return
+        from . import core
+        path = self.t1[1].text().strip() or self.t2[1].text().strip()
+        if not path or not os.path.exists(path):
+            return
+        try:
+            n = core.band_count(path)
+            idx = core.guess_band_idx(path)
+        except Exception:
+            return
+        for sp, v in zip(self.b_spins, idx):
+            sp.setRange(1, max(1, n))
+            sp.setValue(v)
+        self.status.setText(f"Каналов в файле: {n}; подставлены индексы {list(idx)}")
 
     def _save(self):
         s = QSettings()
