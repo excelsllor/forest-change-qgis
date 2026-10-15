@@ -1,4 +1,4 @@
-﻿"""Core inference for the Forest Change QGIS plugin (DOFA + CfC fusion, CPU).
+"""Core inference for the Forest Change QGIS plugin (DOFA + CfC fusion, CPU).
 
 Change is decided by the ALGORITHM (per-pixel |dNDVI|/|dNBR| gate); the network
 only classifies the TYPE of the changed 32 px (320 m) chips.

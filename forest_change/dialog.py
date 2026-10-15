@@ -1,4 +1,4 @@
-﻿import os
+import os
 import traceback
 
 from qgis.PyQt.QtWidgets import (

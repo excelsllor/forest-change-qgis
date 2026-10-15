@@ -1,8 +1,8 @@
-﻿[general]
+[general]
 name=Forest Change Detection (DOFA+CfC)
 qgisMinimumVersion=3.16
 description=Algorithmic change detection (NDVI/NBR gate) plus type classification (logging / windfall / fire) of the changed chips with a DOFA+CfC fusion model on CPU (onnxruntime).
-version=0.4.0
+version=0.4.1
 author=Forest Hackathon Team
 email=team@example.com
 about=Detects forest cover changes between two dates: the change mask is computed algorithmically from the NDVI/NBR difference, and a siamese DOFA + CfC fusion network classifies the type of the changed 32 m chips (320 m cells). Outputs: class raster, merged change polygons and a cells layer (one polygon per changed cell with coordinates, type and confidence). Runs on CPU with onnxruntime (auto-fallback from GPU providers if they fail).
@@ -11,5 +11,3 @@ repository=https://github.com/excelsllor/forest-change-qgis
 tags=forest,change detection,dofa,vit,remote sensing
 category=Analysis
 icon=icon.png
-
-
