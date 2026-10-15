@@ -1,4 +1,5 @@
 import os
+import re
 import traceback
 
 from qgis.PyQt.QtWidgets import (
@@ -21,6 +22,23 @@ MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model")
 DEFAULT_MODEL = os.path.join(MODEL_DIR, "forest_change_fusion128.onnx")
 BANDS6 = ("B02", "B03", "B04", "B08", "B11", "B12")
 SETTINGS = "forest_change"
+DATE_RE = re.compile(r"(20\d{2})[-_./]?(\d{2})(?:[-_./]?(\d{2}))?")
+
+
+def parse_date(text):
+    """Extract an acquisition date from a layer name / file name -> (Y, M, D) or None."""
+    m = DATE_RE.search(os.path.basename(text or ""))
+    if not m:
+        return None
+    y, mo = int(m.group(1)), int(m.group(2))
+    if not 1 <= mo <= 12:
+        return None
+    d = int(m.group(3)) if m.group(3) and 1 <= int(m.group(3)) <= 31 else 1
+    return (y, mo, d)
+
+
+def date_label(dt):
+    return f"{dt[0]}-{dt[1]:02d}-{dt[2]:02d}" if dt else "без даты"
 
 
 class ForestChangeDialog(QDialog):
@@ -49,6 +67,9 @@ class ForestChangeDialog(QDialog):
         refresh = QPushButton("Обновить список слоёв")
         refresh.clicked.connect(self._refresh_layers)
         form.addRow("", refresh)
+        auto = QPushButton("Подставить T1/T2 (два новейших снимка)")
+        auto.clicked.connect(lambda: self._auto_pick(force=True))
+        form.addRow("", auto)
 
         self.mosaic_dir = self._path_row()
         form.addRow("Папка мозаик", self.mosaic_dir[0])
@@ -196,14 +217,54 @@ class ForestChangeDialog(QDialog):
     def _refresh_layers(self):
         self.layers.clear()
         self.layers.addItem("— подтянуть из загруженных слоёв —", None)
+        entries = []
         for layer in QgsProject.instance().mapLayers().values():
-            if layer.type() == QgsMapLayer.RasterLayer:
-                self.layers.addItem(layer.name(), layer.id())
+            if layer.type() != QgsMapLayer.RasterLayer:
+                continue
+            src = layer.source()
+            path = src.split("|")[0]
+            dt = parse_date(layer.name()) or parse_date(path)
+            entries.append((dt, layer.name(), layer.id()))
+        # newest first; layers without a date go last (alphabetical)
+        entries.sort(key=lambda e: (e[0] is not None, e[0] or (0, 0, 0), e[1]), reverse=True)
+        for dt, name, lid in entries:
+            self.layers.addItem(f"{name}  [{date_label(dt)}]", lid)
         try:
             self.layers.currentIndexChanged.disconnect()
         except Exception:
             pass
         self.layers.currentIndexChanged.connect(self._pull_layer)
+        self._auto_pick(entries)
+
+    def _auto_pick(self, entries=None, force=False):
+        """Put the two newest dated raster layers into T2 (newer) and T1 (older)."""
+        if self.mode.currentIndex() != 1:
+            return
+        if entries is None:
+            entries = []
+            for layer in QgsProject.instance().mapLayers().values():
+                if layer.type() != QgsMapLayer.RasterLayer:
+                    continue
+                src = layer.source()
+                path = src.split("|")[0]
+                dt = parse_date(layer.name()) or parse_date(path)
+                if dt:
+                    entries.append((dt, layer.name(), layer.id()))
+            entries.sort(key=lambda e: (e[0], e[1]), reverse=True)
+        dated = [e for e in entries if e[0]]
+        if len(dated) < 2:
+            return
+        if not force and self.t1[1].text().strip() and self.t2[1].text().strip():
+            return                      # user already set them (or restored from settings)
+        t2_layer = QgsProject.instance().mapLayer(dated[0][2])
+        t1_layer = QgsProject.instance().mapLayer(dated[1][2])
+        if t2_layer is not None:
+            self.t2[1].setText(t2_layer.source().split("|")[0])
+        if t1_layer is not None:
+            self.t1[1].setText(t1_layer.source().split("|")[0])
+        self.status.setText(
+            f"Подставлены новейшие слои: T1={dated[1][1]} [{date_label(dated[1][0])}], "
+            f"T2={dated[0][1]} [{date_label(dated[0][0])}]")
 
     def _pull_layer(self):
         lid = self.layers.currentData()
@@ -222,13 +283,14 @@ class ForestChangeDialog(QDialog):
             self.mosaic_dir[1].setText(os.path.dirname(path))
             self.status.setText(f"Папка мозаик: {os.path.dirname(path)}")
         else:
+            dt = parse_date(layer.name()) or parse_date(path)
             if not self.t1[1].text().strip():
                 self.t1[1].setText(path)
             elif not self.t2[1].text().strip() or self.t2[1].text().strip() == path:
                 self.t2[1].setText(path)
             else:
                 self.t1[1].setText(path)
-            self.status.setText(f"Снимок: {os.path.basename(path)}")
+            self.status.setText(f"Снимок: {os.path.basename(path)} [{date_label(dt)}]")
 
     def _update_mode(self):
         period_mode = self.mode.currentIndex() == 0
@@ -236,6 +298,8 @@ class ForestChangeDialog(QDialog):
             w.setEnabled(period_mode)
         for w in (self.t1[0], self.t2[0], self.bands.parentWidget()):
             w.setEnabled(not period_mode)
+        if not period_mode:
+            self._auto_pick()            # fill T1/T2 from the two newest dated layers
 
     def _aoi_bbox(self):
         lid = self.aoi.currentData()
