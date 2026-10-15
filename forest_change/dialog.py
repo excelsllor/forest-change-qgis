@@ -5,7 +5,7 @@ import traceback
 from qgis.PyQt.QtWidgets import (
     QDialog, QVBoxLayout, QFormLayout, QComboBox, QPushButton, QLabel,
     QLineEdit, QProgressBar, QFileDialog, QSpinBox, QHBoxLayout, QWidget,
-    QApplication, QMessageBox, QCheckBox,
+    QApplication, QMessageBox, QCheckBox, QScrollArea,
 )
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtCore import Qt, QSettings
@@ -23,6 +23,8 @@ DEFAULT_MODEL = os.path.join(MODEL_DIR, "forest_change_fusion128.onnx")
 BANDS6 = ("B02", "B03", "B04", "B08", "B11", "B12")
 SETTINGS = "forest_change"
 DATE_RE = re.compile(r"(20\d{2})[-_./]?(\d{2})(?:[-_./]?(\d{2}))?")
+PROVIDERS = [("Авто", "auto"), ("CPU", "cpu"), ("CUDA", "cuda"),
+             ("DirectML", "dml"), ("ROCm", "rocm")]
 
 
 def parse_date(text):
@@ -46,7 +48,8 @@ class ForestChangeDialog(QDialog):
         super().__init__(iface.mainWindow())
         self.iface = iface
         self.setWindowTitle("Forest Change Detection (DOFA+CfC)")
-        self.resize(640, 560)
+        self.resize(680, 640)
+        self.slots = []
         self._build()
         self._restore()
 
@@ -56,33 +59,45 @@ class ForestChangeDialog(QDialog):
         form = QFormLayout()
 
         self.mode = QComboBox()
-        self.mode.addItems(["Готовые периоды (мозаики)", "Свои снимки (T1/T2 GeoTIFF)"])
+        self.mode.addItems(["Загруженные снимки (слоты)", "Готовые периоды (мозаики)"])
         self.mode.currentIndexChanged.connect(self._update_mode)
         form.addRow("Режим", self.mode)
 
-        # --- loaded layers shortcut
-        self.layers = QComboBox()
-        self.layers.addItem("— подтянуть из загруженных слоёв —", None)
-        form.addRow("Слои проекта", self.layers)
+        self.provider = QComboBox()
+        for label, _key in PROVIDERS:
+            self.provider.addItem(label)
+        form.addRow("Провайдер (onnxruntime)", self.provider)
+
+        # --- slots: loaded rasters
+        self.slots_box = QVBoxLayout()
+        slots_w = QWidget()
+        slots_w.setLayout(self.slots_box)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(slots_w)
+        scroll.setMinimumHeight(120)
+        form.addRow("Снимки (выбери слои проекта)", scroll)
+        row = QHBoxLayout()
+        add = QPushButton("+ Добавить снимок")
+        add.clicked.connect(lambda: self._add_slot())
+        row.addWidget(add)
         refresh = QPushButton("Обновить список слоёв")
         refresh.clicked.connect(self._refresh_layers)
-        form.addRow("", refresh)
-        auto = QPushButton("Подставить T1/T2 (два новейших снимка)")
-        auto.clicked.connect(lambda: self._auto_pick(force=True))
-        form.addRow("", auto)
+        row.addWidget(refresh)
+        auto = QPushButton("Подставить два новейших")
+        auto.clicked.connect(lambda: self._auto_fill(force=True))
+        row.addWidget(auto)
+        rw = QWidget()
+        rw.setLayout(row)
+        form.addRow("", rw)
 
+        # --- mosaics mode
         self.mosaic_dir = self._path_row()
         form.addRow("Папка мозаик", self.mosaic_dir[0])
         self.period = QComboBox()
         self.period.addItems(list(periods.PERIOD_DATES.keys()))
         form.addRow("Период", self.period)
 
-        self.t1 = self._path_row()
-        form.addRow("T1 (архив)", self.t1[0])
-        self.t2 = self._path_row()
-        form.addRow("T2 (текущий)", self.t2[0])
-        self.t1[1].textChanged.connect(self._sync_bands)
-        self.t2[1].textChanged.connect(self._sync_bands)
         self.bands = QHBoxLayout()
         self.b_spins = []
         defaults = (2, 3, 4, 8, 11, 12)
@@ -129,8 +144,9 @@ class ForestChangeDialog(QDialog):
         b_all = QPushButton("Маска + изменение (всё сразу)")
         b_all.clicked.connect(self._run_all)
         root.addWidget(b_all)
+        self._add_slot()
+        self._add_slot()
         self._update_mode()
-        self._refresh_layers()
 
     def _path_row(self, dir_mode=False, file_filter="GeoTIFF (*.tif *.tiff)"):
         edit = QLineEdit()
@@ -151,17 +167,131 @@ class ForestChangeDialog(QDialog):
         btn.clicked.connect(browse)
         return w, edit
 
+    # ------------------------------------------------------------ slots
+    def _add_slot(self, path=None):
+        combo = QComboBox()
+        btn = QPushButton("−")
+        row = QHBoxLayout()
+        row.addWidget(combo)
+        row.addWidget(btn)
+        w = QWidget()
+        w.setLayout(row)
+        slot = {"widget": w, "combo": combo, "button": btn}
+        self.slots.append(slot)
+
+        def remove():
+            if len(self.slots) <= 2:
+                QMessageBox.information(self, "Слоты", "Нужно минимум 2 снимка (pre и post).")
+                return
+            self.slots.remove(slot)
+            w.setParent(None)
+            self._sync_bands()
+        btn.clicked.connect(remove)
+        combo.currentIndexChanged.connect(self._sync_bands)
+        self.slots_box.addWidget(w)
+        self._fill_combo(combo, path)
+        return slot
+
+    def _project_rasters(self):
+        out = []
+        for layer in QgsProject.instance().mapLayers().values():
+            if layer.type() != QgsMapLayer.RasterLayer:
+                continue
+            path = layer.source().split("|")[0]
+            dt = parse_date(layer.name()) or parse_date(path)
+            out.append((dt, layer.name(), path))
+        out.sort(key=lambda e: (e[0] is not None, e[0] or (0, 0, 0), e[1]), reverse=True)
+        return out
+
+    def _fill_combo(self, combo, selected=None):
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("— выбери снимок —", None)
+        for dt, name, path in self._project_rasters():
+            combo.addItem(f"{name}  [{date_label(dt)}]", path)
+            if selected and os.path.normcase(path) == os.path.normcase(selected):
+                combo.setCurrentIndex(combo.count() - 1)
+        combo.blockSignals(False)
+
+    def _refresh_layers(self):
+        for slot in self.slots:
+            cur = slot["combo"].currentData()
+            self._fill_combo(slot["combo"], cur)
+        self._auto_fill()
+        self._sync_bands()
+
+    def _auto_fill(self, force=False):
+        if self.mode.currentIndex() != 0:
+            return
+        if not force and any(s["combo"].currentData() for s in self.slots):
+            return
+        dated = [e for e in self._project_rasters() if e[0]]
+        if len(dated) < 2:
+            return
+        while len(self.slots) < 2:
+            self._add_slot()
+        # newest -> last slot (post), next -> first slot (pre)
+        self._fill_combo(self.slots[-1]["combo"], dated[0][2])
+        self._fill_combo(self.slots[0]["combo"], dated[1][2])
+        self.status.setText(
+            f"Подставлены: pre={dated[1][1]} [{date_label(dated[1][0])}], "
+            f"post={dated[0][1]} [{date_label(dated[0][0])}]")
+
+    def _slot_paths(self):
+        paths = [s["combo"].currentData() for s in self.slots if s["combo"].currentData()]
+        dated = [(parse_date(os.path.basename(p)) or (0, 0, 0), p) for p in paths]
+        dated.sort(key=lambda e: e[0])          # oldest first (pre), newest last (post)
+        return [p for _dt, p in dated]
+
+    def _sync_bands(self, *args):
+        if getattr(self, "_loading", False):
+            return
+        paths = self._slot_paths()
+        path = paths[0] if paths else self.mosaic_dir[1].text().strip()
+        if not path or not os.path.exists(path):
+            return
+        try:
+            from . import core
+            n = core.band_count(path)
+            idx = core.guess_band_idx(path)
+        except Exception:
+            return
+        for sp, v in zip(self.b_spins, idx):
+            sp.setRange(1, max(1, n))
+            sp.setValue(v)
+        if paths:
+            self.status.setText(f"Каналов в файле: {n}; подставлены индексы {list(idx)}")
+
+    def _update_mode(self):
+        slots_mode = self.mode.currentIndex() == 0
+        for slot in self.slots:
+            slot["widget"].setEnabled(slots_mode)
+        for w in (self.mosaic_dir[0], self.period):
+            w.setEnabled(not slots_mode)
+        if slots_mode:
+            self._auto_fill()
+
+    def _aoi_bbox(self):
+        lid = self.aoi.currentData()
+        if not lid:
+            return None
+        layer = QgsProject.instance().mapLayer(lid)
+        ext = layer.extent()
+        return (ext.xMinimum(), ext.yMinimum(), ext.xMaximum(), ext.yMaximum())
+
     # ------------------------------------------------------- settings
     def _restore(self):
         self._loading = True
         s = QSettings()
         self.mode.setCurrentIndex(int(s.value(f"{SETTINGS}/mode", 0)))
+        key = str(s.value(f"{SETTINGS}/provider", "auto"))
+        for i, (_lbl, k) in enumerate(PROVIDERS):
+            if k == key:
+                self.provider.setCurrentIndex(i)
         self.mosaic_dir[1].setText(s.value(f"{SETTINGS}/mosaic_dir", ""))
         p = s.value(f"{SETTINGS}/period", "")
         if p in periods.PERIOD_DATES:
             self.period.setCurrentText(p)
-        self.t1[1].setText(s.value(f"{SETTINGS}/t1", ""))
-        self.t2[1].setText(s.value(f"{SETTINGS}/t2", ""))
         bands = s.value(f"{SETTINGS}/bands", "")
         if bands:
             try:
@@ -174,160 +304,41 @@ class ForestChangeDialog(QDialog):
         if model:
             self.model[1].setText(model)
         self.auto_apply.setChecked(str(s.value(f"{SETTINGS}/auto_apply", "true")).lower() == "true")
-        # clamp the saved band indices to the real band counts of the files
-        for path in (self.t1[1].text().strip(), self.t2[1].text().strip()):
-            if path and os.path.exists(path):
-                try:
-                    from . import core
-                    n = core.band_count(path)
-                    for sp in self.b_spins:
-                        sp.setRange(1, max(1, n))
-                        if sp.value() > n:
-                            sp.setValue(n)
-                except Exception:
-                    pass
+        saved_slots = [x for x in str(s.value(f"{SETTINGS}/slots", "")).split("|") if x]
+        while len(self.slots) < max(2, len(saved_slots)):
+            self._add_slot()
+        for slot, path in zip(self.slots, saved_slots):
+            self._fill_combo(slot["combo"], path)
         self._loading = False
         self._update_mode()
-
-    def _sync_bands(self, *args):
-        """Auto-pick band indices for the chosen file (S2 L2A order for >=12 bands)."""
-        if getattr(self, "_loading", False):
-            return
-        from . import core
-        path = self.t1[1].text().strip() or self.t2[1].text().strip()
-        if not path or not os.path.exists(path):
-            return
-        try:
-            n = core.band_count(path)
-            idx = core.guess_band_idx(path)
-        except Exception:
-            return
-        for sp, v in zip(self.b_spins, idx):
-            sp.setRange(1, max(1, n))
-            sp.setValue(v)
-        self.status.setText(f"Каналов в файле: {n}; подставлены индексы {list(idx)}")
+        self._sync_bands()
 
     def _save(self):
         s = QSettings()
         s.setValue(f"{SETTINGS}/mode", self.mode.currentIndex())
+        s.setValue(f"{SETTINGS}/provider", PROVIDERS[self.provider.currentIndex()][1])
         s.setValue(f"{SETTINGS}/mosaic_dir", self.mosaic_dir[1].text().strip())
         s.setValue(f"{SETTINGS}/period", self.period.currentText())
-        s.setValue(f"{SETTINGS}/t1", self.t1[1].text().strip())
-        s.setValue(f"{SETTINGS}/t2", self.t2[1].text().strip())
         s.setValue(f"{SETTINGS}/bands", ",".join(str(sp.value()) for sp in self.b_spins))
         s.setValue(f"{SETTINGS}/out", self.out[1].text().strip())
         s.setValue(f"{SETTINGS}/model", self.model[1].text().strip())
         s.setValue(f"{SETTINGS}/auto_apply", "true" if self.auto_apply.isChecked() else "false")
-
-    # ---------------------------------------------------------- layers
-    def _refresh_layers(self):
-        self.layers.clear()
-        self.layers.addItem("— подтянуть из загруженных слоёв —", None)
-        entries = []
-        for layer in QgsProject.instance().mapLayers().values():
-            if layer.type() != QgsMapLayer.RasterLayer:
-                continue
-            src = layer.source()
-            path = src.split("|")[0]
-            dt = parse_date(layer.name()) or parse_date(path)
-            entries.append((dt, layer.name(), layer.id()))
-        # newest first; layers without a date go last (alphabetical)
-        entries.sort(key=lambda e: (e[0] is not None, e[0] or (0, 0, 0), e[1]), reverse=True)
-        for dt, name, lid in entries:
-            self.layers.addItem(f"{name}  [{date_label(dt)}]", lid)
-        try:
-            self.layers.currentIndexChanged.disconnect()
-        except Exception:
-            pass
-        self.layers.currentIndexChanged.connect(self._pull_layer)
-        self._auto_pick(entries)
-
-    def _auto_pick(self, entries=None, force=False):
-        """Put the two newest dated raster layers into T2 (newer) and T1 (older)."""
-        if self.mode.currentIndex() != 1:
-            return
-        if entries is None:
-            entries = []
-            for layer in QgsProject.instance().mapLayers().values():
-                if layer.type() != QgsMapLayer.RasterLayer:
-                    continue
-                src = layer.source()
-                path = src.split("|")[0]
-                dt = parse_date(layer.name()) or parse_date(path)
-                if dt:
-                    entries.append((dt, layer.name(), layer.id()))
-            entries.sort(key=lambda e: (e[0], e[1]), reverse=True)
-        dated = [e for e in entries if e[0]]
-        if len(dated) < 2:
-            return
-        if not force and self.t1[1].text().strip() and self.t2[1].text().strip():
-            return                      # user already set them (or restored from settings)
-        t2_layer = QgsProject.instance().mapLayer(dated[0][2])
-        t1_layer = QgsProject.instance().mapLayer(dated[1][2])
-        if t2_layer is not None:
-            self.t2[1].setText(t2_layer.source().split("|")[0])
-        if t1_layer is not None:
-            self.t1[1].setText(t1_layer.source().split("|")[0])
-        self.status.setText(
-            f"Подставлены новейшие слои: T1={dated[1][1]} [{date_label(dated[1][0])}], "
-            f"T2={dated[0][1]} [{date_label(dated[0][0])}]")
-
-    def _pull_layer(self):
-        lid = self.layers.currentData()
-        if not lid:
-            return
-        layer = QgsProject.instance().mapLayer(lid)
-        if layer is None:
-            return
-        src = layer.source()
-        path = src.split("|")[0]
-        if not os.path.exists(path):
-            QMessageBox.information(self, "Слой", "У слоя нет файлового источника — укажите путь вручную")
-            return
-        if self.mode.currentIndex() == 0:
-            # mosaic mode: the layer's folder usually contains <date>_<band>.tif
-            self.mosaic_dir[1].setText(os.path.dirname(path))
-            self.status.setText(f"Папка мозаик: {os.path.dirname(path)}")
-        else:
-            dt = parse_date(layer.name()) or parse_date(path)
-            if not self.t1[1].text().strip():
-                self.t1[1].setText(path)
-            elif not self.t2[1].text().strip() or self.t2[1].text().strip() == path:
-                self.t2[1].setText(path)
-            else:
-                self.t1[1].setText(path)
-            self.status.setText(f"Снимок: {os.path.basename(path)} [{date_label(dt)}]")
-
-    def _update_mode(self):
-        period_mode = self.mode.currentIndex() == 0
-        for w in (self.mosaic_dir[0], self.period):
-            w.setEnabled(period_mode)
-        for w in (self.t1[0], self.t2[0], self.bands.parentWidget()):
-            w.setEnabled(not period_mode)
-        if not period_mode:
-            self._auto_pick()            # fill T1/T2 from the two newest dated layers
-
-    def _aoi_bbox(self):
-        lid = self.aoi.currentData()
-        if not lid:
-            return None
-        layer = QgsProject.instance().mapLayer(lid)
-        ext = layer.extent()
-        return (ext.xMinimum(), ext.yMinimum(), ext.xMaximum(), ext.yMaximum())
+        s.setValue(f"{SETTINGS}/slots", "|".join(str(sl["combo"].currentData() or "") for sl in self.slots))
 
     # ------------------------------------------------------------- run
     def _mode(self):
-        return "period" if self.mode.currentIndex() == 0 else "files"
+        return "slots" if self.mode.currentIndex() == 0 else "period"
 
     def _params(self):
         if self.mode.currentIndex() == 0:
-            return dict(period=self.period.currentText(),
-                        mosaic_dir=self.mosaic_dir[1].text().strip(),
-                        aoi_bbox=self._aoi_bbox())
-        return dict(t1_path=self.t1[1].text().strip(),
-                    t2_path=self.t2[1].text().strip(),
-                    band_idx=tuple(sp.value() for sp in self.b_spins),
-                    aoi_bbox=self._aoi_bbox())
+            return dict(files=self._slot_paths(),
+                        band_idx=tuple(sp.value() for sp in self.b_spins),
+                        aoi_bbox=self._aoi_bbox(),
+                        provider=PROVIDERS[self.provider.currentIndex()][1])
+        return dict(period=self.period.currentText(),
+                    mosaic_dir=self.mosaic_dir[1].text().strip(),
+                    aoi_bbox=self._aoi_bbox(),
+                    provider=PROVIDERS[self.provider.currentIndex()][1])
 
     def _progress(self):
         def progress(p):
@@ -335,10 +346,25 @@ class ForestChangeDialog(QDialog):
             QApplication.processEvents()
         return progress
 
+    def _check_inputs(self):
+        if self.mode.currentIndex() == 0:
+            paths = self._slot_paths()
+            if len(paths) < 2:
+                QMessageBox.warning(self, "Ошибка",
+                                    "Выберите минимум 2 снимка в слотах (pre и post).")
+                return False
+            return True
+        if not self.mosaic_dir[1].text().strip():
+            QMessageBox.warning(self, "Ошибка", "Укажите папку мозаик")
+            return False
+        return True
+
     def _run_mask(self):
         out_dir = self.out[1].text().strip()
         if not out_dir:
             QMessageBox.warning(self, "Ошибка", "Укажите папку вывода (маски)")
+            return
+        if not self._check_inputs():
             return
         self._save()
         try:
@@ -346,7 +372,8 @@ class ForestChangeDialog(QDialog):
             self.status.setText("Считаю маску (алгоритм)…")
             self.bar.setValue(0)
             QApplication.setOverrideCursor(_WAIT_CURSOR)
-            summary = core.compute_mask(self._mode(), out_dir, progress=self._progress(), **self._params())
+            summary = core.compute_mask("files" if self._mode() == "slots" else "period",
+                                        out_dir, progress=self._progress(), **self._params())
             rl = QgsRasterLayer(summary["mask_tif"], "Маска изменений")
             if rl.isValid():
                 QgsProject.instance().addMapLayer(rl)
@@ -372,13 +399,16 @@ class ForestChangeDialog(QDialog):
         if not out_dir:
             QMessageBox.warning(self, "Ошибка", "Укажите папку вывода (маски)")
             return
+        if not self._check_inputs():
+            return
         self._save()
         try:
             from . import core
             self.status.setText("Классифицирую тип по маске…")
             self.bar.setValue(0)
             QApplication.setOverrideCursor(_WAIT_CURSOR)
-            summary = core.predict(self._mode(), model, out_dir, progress=self._progress(), **self._params())
+            summary = core.predict("files" if self._mode() == "slots" else "period",
+                                   model, out_dir, progress=self._progress(), **self._params())
             self._load_results(summary)
             self.status.setText(
                 f"Готово (маска: {summary.get('used_mask') or 'пересчитана'}). "
@@ -399,14 +429,17 @@ class ForestChangeDialog(QDialog):
         if not out_dir:
             QMessageBox.warning(self, "Ошибка", "Укажите папку вывода (маски)")
             return
+        if not self._check_inputs():
+            return
         self._save()
         try:
             from . import core
             self.status.setText("Инференс (маска + тип)…")
             self.bar.setValue(0)
             QApplication.setOverrideCursor(_WAIT_CURSOR)
-            m = core.compute_mask(self._mode(), out_dir, **self._params())
-            summary = core.predict(self._mode(), model, out_dir, progress=self._progress(), **self._params())
+            mode = "files" if self._mode() == "slots" else "period"
+            m = core.compute_mask(mode, out_dir, **self._params())
+            summary = core.predict(mode, model, out_dir, progress=self._progress(), **self._params())
             self._load_results(summary)
             self.status.setText(
                 f"Готово. Маска: {m['changed_ha']:.1f} га. Клеток: {summary.get('cells', 0)}. "
@@ -436,7 +469,6 @@ class ForestChangeDialog(QDialog):
                 self._style_vector(cl)
         canvas = self.iface.mapCanvas()
         if self.auto_apply.isChecked():
-            # immediately overlay and zoom to the detected masks
             if rl.isValid():
                 canvas.setExtent(rl.extent())
             elif vl.isValid():

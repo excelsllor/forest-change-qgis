@@ -39,6 +39,14 @@ SEQ_DATES = ("2023-09", "2024-05", "2025-07", "2026-06")
 SCL_INVALID = [0, 1, 3, 8, 9, 10, 11]
 PROVIDER_ORDER = ["DmlExecutionProvider", "CUDAExecutionProvider", "ROCMExecutionProvider",
                   "CoreMLExecutionProvider", "CPUExecutionProvider"]
+PROVIDER_MAP = {
+    "auto": PROVIDER_ORDER,
+    "cpu": ["CPUExecutionProvider"],
+    "cuda": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+    "dml": ["DmlExecutionProvider", "CPUExecutionProvider"],
+    "directml": ["DmlExecutionProvider", "CPUExecutionProvider"],
+    "rocm": ["ROCMExecutionProvider", "CPUExecutionProvider"],
+}
 CHIP = 32          # 320 m at 10 m resolution (same scale as the training chips)
 SIZE = 128         # model input
 BATCH = 64
@@ -49,10 +57,17 @@ MIN_AREA_HA = 0.0  # drop merged polygons smaller than this (0 = keep all)
 TILE_PX = int(os.environ.get("FC_TILE", "1024"))   # processing window (multiple of CHIP)
 
 
-def pick_providers():
+def pick_providers(preferred="auto"):
+    """Execution providers according to the user's choice (falls back to CPU)."""
     import onnxruntime as ort
     avail = ort.get_available_providers()
-    return [p for p in PROVIDER_ORDER if p in avail] or ["CPUExecutionProvider"]
+    want = PROVIDER_MAP.get(str(preferred or "auto").lower(), PROVIDER_ORDER)
+    got = [p for p in want if p in avail]
+    if not got:
+        print(f"[forest_change] провайдер '{preferred}' недоступен (есть: {avail}), использую CPU",
+              flush=True)
+        got = ["CPUExecutionProvider"]
+    return got
 
 
 def _resize_bilinear(a, size):
@@ -82,17 +97,17 @@ def _softmax(x):
 
 
 class Model:
-    def __init__(self, path):
+    def __init__(self, path, provider="auto"):
         import onnxruntime as ort
         self._ort = ort
         with open(path, "rb") as fh:
             self._buf = fh.read()
-        providers = pick_providers()
+        providers = pick_providers(provider)
         try:
             self.sess = ort.InferenceSession(self._buf, providers=providers)
         except Exception:
             self.sess = ort.InferenceSession(self._buf, providers=["CPUExecutionProvider"])
-        self._cpu_only = False
+        self._cpu_only = self.sess.get_providers() == ["CPUExecutionProvider"]
 
     @property
     def provider(self):
@@ -209,8 +224,11 @@ def band_count(path):
 
 
 # ---------------------------------------------------------------- tiling
-def _setup(mode, period, mosaic_dir, t1_path, t2_path, aoi_bbox):
-    """Reference grid, AOI window and the list of files to validate."""
+def _setup(mode, period=None, mosaic_dir=None, files=None, t1_path=None, t2_path=None,
+           aoi_bbox=None):
+    """Reference grid, AOI window, resolved pre/post/seq inputs and files to validate."""
+    pre_path = post_path = None
+    seq_paths = None
     if mode == "period":
         try:
             from . import periods
@@ -220,9 +238,17 @@ def _setup(mode, period, mosaic_dir, t1_path, t2_path, aoi_bbox):
         ref = os.path.join(mosaic_dir, f"{date1}_B08.tif")
         check = [os.path.join(mosaic_dir, f"{d}_{b}.tif") for d in SEQ_DATES for b in BANDS6]
     else:
+        fl = [p for p in (files or []) if p]
+        if not fl and t1_path and t2_path:
+            fl = [t1_path, t2_path]
+        fl = [p for p in fl if os.path.exists(p)]
+        if len(fl) < 2:
+            raise ValueError("Нужно выбрать минимум 2 снимка (pre и post) из загруженных слоёв.")
         date1, date2 = "T1", "T2"
-        ref = t1_path
-        check = [t1_path, t2_path]
+        ref = fl[0]
+        check = fl
+        pre_path, post_path = fl[0], fl[-1]
+        seq_paths = ([None] * (4 - min(4, len(fl))) + fl[-4:])[:4]   # up to 4 dates, padded
     gt, W, H, proj = _grid_from(ref)
     _assert_same_grid(check, ref)
     if aoi_bbox:
@@ -234,7 +260,8 @@ def _setup(mode, period, mosaic_dir, t1_path, t2_path, aoi_bbox):
     else:
         c0, r0, c1, r1 = 0, 0, W, H
     return dict(gt=gt, proj=proj, c0=c0, r0=r0, w=c1 - c0, h=r1 - r0,
-                date1=date1, date2=date2)
+                date1=date1, date2=date2, pre_path=pre_path, post_path=post_path,
+                seq_paths=seq_paths, period=period, mosaic_dir=mosaic_dir)
 
 
 def _tiles(w, h, tile=None):
@@ -247,15 +274,15 @@ def _tiles(w, h, tile=None):
     return out
 
 
-def _read_tile(mode, period, mosaic_dir, t1_path, t2_path, band_idx, c0, r0, w, h,
-               invalid_ok=True, with_seq=True):
-    """Read one window of both dates (+ the 4-date feature stack) and the invalid mask."""
+def _read_tile(s, mode, band_idx, c0, r0, w, h, with_seq=True):
+    """Read one window of both dates (+ the feature stack) and the invalid mask."""
     if mode == "period":
         try:
             from . import periods
         except Exception:
             import periods
-        date1, date2 = periods.PERIOD_DATES[period]
+        mosaic_dir = s["mosaic_dir"]
+        date1, date2 = periods.PERIOD_DATES[s["period"]]
         A = _read_mosaic6(mosaic_dir, date1, c0, r0, w, h)
         B = _read_mosaic6(mosaic_dir, date2, c0, r0, w, h)
         if with_seq:
@@ -268,24 +295,29 @@ def _read_tile(mode, period, mosaic_dir, t1_path, t2_path, band_idx, c0, r0, w, 
             seq_map = np.stack(feats)                        # (4,9,h,w)
         else:
             seq_map = None
-        invalid = None
-        if invalid_ok:
-            invalid = (A[3] == 0) | (B[3] == 0)
-            for date in (date1, date2):
-                p = os.path.join(mosaic_dir, f"{date}_SCL.tif")
-                if os.path.exists(p):
-                    invalid |= np.isin(_read_band1(p, c0, r0, w, h), SCL_INVALID)
+        invalid = (A[3] == 0) | (B[3] == 0)
+        for date in (date1, date2):
+            p = os.path.join(mosaic_dir, f"{date}_SCL.tif")
+            if os.path.exists(p):
+                invalid |= np.isin(_read_band1(p, c0, r0, w, h), SCL_INVALID)
     else:
         idx = band_idx or (1, 2, 3, 4, 5, 6)
-        A = _read_stack(t1_path, idx, c0, r0, w, h)
-        B = _read_stack(t2_path, idx, c0, r0, w, h)
+        A = _read_stack(s["pre_path"], idx, c0, r0, w, h)
+        B = _read_stack(s["post_path"], idx, c0, r0, w, h)
         if with_seq:
-            f1 = _features9(A)
-            f2 = _features9(B)
-            seq_map = np.stack([f1, f2, np.zeros_like(f1), np.zeros_like(f1)])
+            feats = []
+            for p in s["seq_paths"]:
+                if p:
+                    try:
+                        feats.append(_features9(_read_stack(p, idx, c0, r0, w, h)))
+                    except Exception:
+                        feats.append(np.zeros((9, h, w), np.float32))
+                else:
+                    feats.append(np.zeros((9, h, w), np.float32))
+            seq_map = np.stack(feats)
         else:
             seq_map = None
-        invalid = ((A[3] == 0) | (B[3] == 0)) if invalid_ok else None
+        invalid = (A[3] == 0) | (B[3] == 0)
     return A, B, seq_map, invalid
 
 
@@ -299,11 +331,12 @@ def _gate(A, B, invalid, thr=None):
 
 
 # ---------------------------------------------------------------- step 1: mask
-def compute_mask(mode, out_dir, period=None, mosaic_dir=None, t1_path=None, t2_path=None,
-                 band_idx=None, aoi_bbox=None, progress=None, thr=None):
+def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_path=None,
+                 t2_path=None, band_idx=None, aoi_bbox=None, progress=None, thr=None,
+                 provider="auto"):
     """Algorithmic change mask only (no neural network) -> mask.tif (1 changed / 0 / 255)."""
     os.makedirs(out_dir, exist_ok=True)
-    s = _setup(mode, period, mosaic_dir, t1_path, t2_path, aoi_bbox)
+    s = _setup(mode, period, mosaic_dir, files, t1_path, t2_path, aoi_bbox)
     path = os.path.join(out_dir, "mask.tif")
     ds = _create_raster(path, s["gt"], s["c0"], s["r0"], s["w"], s["h"], s["proj"])
     band = ds.GetRasterBand(1)
@@ -313,8 +346,8 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, t1_path=None, t2_p
     if progress:
         progress(1)
     for i, (x, y, tw, th) in enumerate(tiles):
-        A, B, _, invalid = _read_tile(mode, period, mosaic_dir, t1_path, t2_path, band_idx,
-                                      s["c0"] + x, s["r0"] + y, tw, th, with_seq=False)
+        A, B, _, invalid = _read_tile(s, mode, band_idx, s["c0"] + x, s["r0"] + y, tw, th,
+                                      with_seq=False)
         change = _gate(A, B, invalid, thr)
         out = np.zeros((th, tw), np.uint8)
         out[change] = 1
@@ -337,11 +370,12 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, t1_path=None, t2_p
 
 
 # ---------------------------------------------------------------- step 2: types
-def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, t1_path=None,
-            t2_path=None, band_idx=None, aoi_bbox=None, progress=None, mask_path=None):
+def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None, t1_path=None,
+            t2_path=None, band_idx=None, aoi_bbox=None, progress=None, mask_path=None,
+            provider="auto"):
     """Type classification of the changed chips (tiles without changes are skipped)."""
     os.makedirs(out_dir, exist_ok=True)
-    s = _setup(mode, period, mosaic_dir, t1_path, t2_path, aoi_bbox)
+    s = _setup(mode, period, mosaic_dir, files, t1_path, t2_path, aoi_bbox)
     gt, proj, c0, r0, w, h = s["gt"], s["proj"], s["c0"], s["r0"], s["w"], s["h"]
     cls_path = os.path.join(out_dir, "classes.tif")
     ds_out = _create_raster(cls_path, gt, c0, r0, w, h, proj)
@@ -349,7 +383,7 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, t1_path=Non
 
     mask_file = mask_path or os.path.join(out_dir, "mask.tif")
     use_mask = os.path.exists(mask_file)
-    model = Model(model_path)
+    model = Model(model_path, provider)
     cells = []
     tiles = _tiles(w, h)
     if progress:
@@ -381,12 +415,12 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, t1_path=Non
                 if progress:
                     progress(int(100 * (ti + 1) / len(tiles)))
                 continue
-            A, B, seq_map, invalid = _read_tile(mode, period, mosaic_dir, t1_path, t2_path,
-                                                band_idx, c0 + x, r0 + y, tw, th, with_seq=True)
+            A, B, seq_map, invalid = _read_tile(s, mode, band_idx, c0 + x, r0 + y, tw, th,
+                                                with_seq=True)
             change &= ~invalid
         else:
-            A, B, seq_map, invalid = _read_tile(mode, period, mosaic_dir, t1_path, t2_path,
-                                                band_idx, c0 + x, r0 + y, tw, th, with_seq=True)
+            A, B, seq_map, invalid = _read_tile(s, mode, band_idx, c0 + x, r0 + y, tw, th,
+                                                with_seq=True)
             change = _gate(A, B, invalid)
 
         coords = [(r, c) for r in range(0, th - CHIP + 1, CHIP)
