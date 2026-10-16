@@ -2,11 +2,11 @@
 name=Forest Change Detection (DOFA+CfC)
 qgisMinimumVersion=3.16
 qgisMaximumVersion=4.99
-description=Algorithmic change detection (NDVI/NBR gate, SCL + NDVI forest filter) plus type classification (logging / windfall / fire) of the changed chips with a DOFA+CfC fusion model on CPU (onnxruntime) or GPU (ROCm torch worker).
-version=0.10.0
+description=Forest change detection: the binary change mask is produced by a neural model (3D-CNN + CfC, F1 0.943), the change type (logging / windfall / fire) is classified by a DOFA+CfC fusion network on 320 m cells.
+version=0.11.0
 author=Forest Hackathon Team
 email=team@example.com
-about=Detects forest cover changes between two dates: the change mask is computed algorithmically from the NDVI/NBR difference (urban/water/bare pixels are excluded via Sentinel-2 SCL and an NDVI vegetation check), and a siamese DOFA + CfC fusion network classifies the type of the changed 32 m chips (320 m cells). Outputs: class raster, merged change polygons and a cells layer (one polygon per changed cell with coordinates, type and confidence). Runs on CPU with onnxruntime (auto-fallback from GPU providers if they fail); on AMD Windows a "ROCm (torch, GPU)" provider runs the model in a persistent PyTorch worker process (~6x faster).
+about=Detects forest cover changes between two dates (or a whole time series): the change mask is computed by a compact neural model - a 3D convolutional network over the multi-date volume fused with a CfC recurrent branch (binary F1 0.943 on held-out quarters, works with 2-36 dates) - and a siamese DOFA + CfC fusion network classifies the type of the changed 32 px (320 m) chips (logging/windfall/fire, macro-F1 0.938 among changed chips). Urban/water/bare pixels are excluded via Sentinel-2 SCL and an NDVI vegetation check. Outputs: class raster, merged change polygons and a cells layer (one polygon per changed cell with coordinates, type and confidence). Runs on CPU (onnxruntime); on AMD Windows an optional ROCm (torch) provider accelerates the type step ~6x.
 tracker=https://github.com/excelsllor/forest-change-qgis/issues
 repository=https://github.com/excelsllor/forest-change-qgis
 tags=forest,change detection,dofa,vit,remote sensing

@@ -20,6 +20,7 @@ from . import periods
 
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model")
 DEFAULT_MODEL = os.path.join(MODEL_DIR, "forest_change_fusion128.onnx")
+DEFAULT_MASK_MODEL = os.path.join(MODEL_DIR, "mask_mini3d.onnx")
 BANDS6 = ("B02", "B03", "B04", "B08", "B11", "B12")
 SETTINGS = "forest_change"
 DATE_RE = re.compile(r"(20\d{2})[-_./]?(\d{2})(?:[-_./]?(\d{2}))?")
@@ -123,7 +124,10 @@ class ForestChangeDialog(QDialog):
         form.addRow("Папка вывода (маски)", self.out[0])
         self.model = self._path_row(file_filter="ONNX (*.onnx)")
         self.model[1].setText(DEFAULT_MODEL)
-        form.addRow("ONNX-модель", self.model[0])
+        form.addRow("ONNX-модель (тип)", self.model[0])
+        self.mask_model = self._path_row(file_filter="ONNX (*.onnx)")
+        self.mask_model[1].setText(DEFAULT_MASK_MODEL)
+        form.addRow("ONNX-модель маски (3D-CNN+CfC)", self.mask_model[0])
 
         self.auto_apply = QCheckBox("Сразу накладывать маски на карту и приближать к ним")
         self.auto_apply.setChecked(True)
@@ -303,6 +307,9 @@ class ForestChangeDialog(QDialog):
         model = s.value(f"{SETTINGS}/model", "")
         if model:
             self.model[1].setText(model)
+        mm = s.value(f"{SETTINGS}/mask_model", "")
+        if mm:
+            self.mask_model[1].setText(mm)
         self.auto_apply.setChecked(str(s.value(f"{SETTINGS}/auto_apply", "true")).lower() == "true")
         saved_slots = [x for x in str(s.value(f"{SETTINGS}/slots", "")).split("|") if x]
         while len(self.slots) < max(2, len(saved_slots)):
@@ -322,6 +329,7 @@ class ForestChangeDialog(QDialog):
         s.setValue(f"{SETTINGS}/bands", ",".join(str(sp.value()) for sp in self.b_spins))
         s.setValue(f"{SETTINGS}/out", self.out[1].text().strip())
         s.setValue(f"{SETTINGS}/model", self.model[1].text().strip())
+        s.setValue(f"{SETTINGS}/mask_model", self.mask_model[1].text().strip())
         s.setValue(f"{SETTINGS}/auto_apply", "true" if self.auto_apply.isChecked() else "false")
         s.setValue(f"{SETTINGS}/slots", "|".join(str(sl["combo"].currentData() or "") for sl in self.slots))
 
@@ -339,7 +347,6 @@ class ForestChangeDialog(QDialog):
                     mosaic_dir=self.mosaic_dir[1].text().strip(),
                     aoi_bbox=self._aoi_bbox(),
                     provider=PROVIDERS[self.provider.currentIndex()][1])
-
     def _progress(self):
         def progress(p):
             self.bar.setValue(p)
@@ -373,7 +380,9 @@ class ForestChangeDialog(QDialog):
             self.bar.setValue(0)
             QApplication.setOverrideCursor(_WAIT_CURSOR)
             summary = core.compute_mask("files" if self._mode() == "slots" else "period",
-                                        out_dir, progress=self._progress(), **self._params())
+                                        out_dir, progress=self._progress(),
+                                        mask_model=self.mask_model[1].text().strip(),
+                                        **self._params())
             rl = QgsRasterLayer(summary["mask_tif"], "Маска изменений")
             if rl.isValid():
                 QgsProject.instance().addMapLayer(rl)
@@ -438,7 +447,8 @@ class ForestChangeDialog(QDialog):
             self.bar.setValue(0)
             QApplication.setOverrideCursor(_WAIT_CURSOR)
             mode = "files" if self._mode() == "slots" else "period"
-            m = core.compute_mask(mode, out_dir, **self._params())
+            m = core.compute_mask(mode, out_dir,
+                                  mask_model=self.mask_model[1].text().strip(), **self._params())
             summary = core.predict(mode, model, out_dir, progress=self._progress(), **self._params())
             self._load_results(summary)
             self.status.setText(

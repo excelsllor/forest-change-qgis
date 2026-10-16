@@ -3,3 +3,4 @@ __pycache__/
 *.zip
 forest_change/model/*.onnx
 forest_change/model/*.pth
+!forest_change/model/mask_mini3d.onnx
