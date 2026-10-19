@@ -51,10 +51,10 @@ C:\Users\<user>\AppData\Local\Programs\OSGeo4W\apps\Python312\python.exe -m pip 
 # опционально GPU: -m pip install onnxruntime-directml
 ```
 
-**Модели типов** (в ZIP не входят, 39 МБ): скачайте `typenet_encoder.onnx` и
-`typenet_cfc.onnx` из [Releases моделей](https://github.com/excelsllor/forest-change-model/releases)
-и положите в `forest_change/model/` (энкодер ищется рядом с CfC-моделью автоматически).
-**Модель маски** `masknet_v2_cfc.onnx` (6.9 МБ) входит в ZIP (в релизах моделей — `masknet_v2_bicfcpn_big.pth`).
+**Модели (46 МБ) входят в ZIP:** `masknet_v2_cfc.onnx` (6.9 МБ), `typenet_encoder.onnx` (30.4 МБ),
+`typenet_cfc.onnx` (9.0 МБ). Legacy-модель `forest_change_fusion128.onnx` (426 МБ, старая версия)
+в ZIP не входит — при желании скачайте из Releases моделей. Чекпоинты для дообучения —
+в репозитории [forest-change-model](https://github.com/excelsllor/forest-change-model) (v2.0).
 
 ## Как проверить
 
