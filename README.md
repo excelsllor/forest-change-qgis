@@ -19,8 +19,9 @@ macro-F1 0.870 на val, строго по маске). Геообработка
 2. **Тип (модель)**: для изменённых чипов TypeNet из двух ONNX:
    - `typenet_encoder.onnx` — CnnDofaLike 7.58M: для каждой даты чипа (≤8) считает
      признак 768-d (λ-стем + 12 depthwise-separable слоёв, RF≈185 px, GAP);
-   - `typenet_cfc.onnx` — TypeNetFeats 2.21M: concat(feats, doy, dt) → 2 блока
-     двунаправленного CfC (ширина 256) → 3 класса: logging / windfall / fire.
+   - `typenet_cfc.onnx` — TypeNetFeats 2.70M: concat(feats, doy, dt) → 2 блока
+     двунаправленного CfC (ширина 256) + сводки mean/last−first → 3 класса; динамическое T (2–8),
+     CfC на CPU.
 3. Неизменённые чипы пропускаются без прогона сети типов (`no_change` не классифицируется).
 
 ## Возможности
@@ -51,8 +52,8 @@ C:\Users\<user>\AppData\Local\Programs\OSGeo4W\apps\Python312\python.exe -m pip 
 # опционально GPU: -m pip install onnxruntime-directml
 ```
 
-**Модели (49 МБ) входят в ZIP:** `masknet_v2_cfc.onnx` (7.6 МБ), `typenet_encoder.onnx` (30.4 МБ),
-`typenet_cfc.onnx` (11.0 МБ). Legacy-модель `forest_change_fusion128.onnx` (426 МБ, старая версия)
+**Модели (52 МБ) входят в ZIP:** `masknet_encoder.onnx` (5.7 МБ), `masknet_cfc.onnx` (4.9 МБ, контекст 3×3),
+`typenet_encoder.onnx` (30.4 МБ), `typenet_cfc.onnx` (10.9 МБ, динамическое T, CfC на CPU). Legacy-модель `forest_change_fusion128.onnx` (426 МБ, старая версия)
 в ZIP не входит — при желании скачайте из Releases моделей. Чекпоинты для дообучения —
 в репозитории [forest-change-model](https://github.com/excelsllor/forest-change-model) (v2.0).
 
@@ -72,27 +73,27 @@ C:\Users\<user>\AppData\Local\Programs\OSGeo4W\apps\Python312\python.exe -m pip 
 
 (Режим **«Готовые периоды (мозаики)»** — для наших мозаик `<дата>_<band>.tif` с 4 каноническими датами.)
 
-**Ориентир (проверено на p3-мозаике, 2025-07→2026-06, 98 тайлов):** маска 45 698 чипов
-(467.9 тыс. га) за 92 с; типы для 43 720 клеток за 749 с (DirectML); выход — `classes.tif`,
-`changes.gpkg`, `cells.gpkg`.
+**Ориентир (проверено на p3-мозаике, 2025-07→2026-06, 98 тайлов):** маска 14 087 чипов
+(144.3 тыс. га) за 53 с; типы для 13 376 клеток за 169 с (энкодер DirectML, CfC на CPU);
+выход — `classes.tif`, `changes.gpkg`, `cells.gpkg`.
 
 **Если в логе появилось `provider ... failed, falling back to CPUExecutionProvider`** —
 это норма: плагин сам переключается на CPU, если выбранный провайдер не сработал.
 
-**Скорость:** маска ~1 с/тайл 1024×1024 на CPU; типы ~1.3 мс/чип энкодера (GPU, 256 чипов),
-~19 мс/чип на CPU. Для больших AOI выбирайте DirectML/CUDA.
+**Скорость:** маска ~0.5 с/тайл (кэш GDAL-хендлов + async-prefetch); типы ~12.6 мс/клетка
+(энкодер на DirectML ~2.4 мс/чип-дата, CfC на CPU). Для больших AOI выбирайте DirectML/CUDA.
 
 ## Точность
 
-**Маска изменения (бинарно, MaskNet-v2 bicfcpn_big + голова со сводками):**
+**Маска изменения (бинарно, MaskNet-v2 bicfcpn_big + сводки + контекст 3×3):**
 
 | метрика | значение |
 |---|---|
-| val F1 (смешанный пул) | **0.916** |
-| организаторы (held-out кварталы) | **0.887** (P 0.906 / R 0.869), p1/p2/p3 0.846/0.908/0.903 |
-| каналы C=6 / 5 (без B12) / 4 | 0.887 / 0.856 / 0.882 |
+| val F1 (vozh, полные ряды) | **0.936** (P 0.942 / R 0.931), p1/p2/p3 0.939/0.971/0.907 |
+| организаторы (held-out кварталы) | **0.936** (P 0.942 / R 0.931) |
+| GT p3 на сцене (через плагин) | P 0.963 / R 0.951 / F1 **0.957** |
 | zero-vol (без снимков) | 0.008 — решения полностью из изображений |
-| скорость (256 чипов) | GPU 339 мс, CPU 3.85 с |
+| скорость (256 чипов) | GPU 339 мс, CPU 3.85 с; вся сцена p3 — 53 с |
 
 **Тип изменения (TypeNet, строго по маске; val, macro по присутствующим классам):**
 

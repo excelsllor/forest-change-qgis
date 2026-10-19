@@ -24,6 +24,7 @@ Outputs in out_dir: mask.tif, classes.tif, changes.gpkg, cells.gpkg, summary.jso
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from osgeo import gdal, ogr, osr
@@ -48,7 +49,8 @@ PROVIDER_MAP = {
 }
 CHIP = 32          # 320 m at 10 m resolution (same scale as the training chips)
 SCALE = 10000.0
-MASK_T = 8             # fixed sequence length of the exported mask ONNX (zero padding)
+MASK_T = 8             # fixed sequence length of the exported type ONNX (zero padding)
+MASK_CTX_T = 4         # fixed sequence length of the context mask ONNX (as in its training)
 MASK_BATCH = 128       # chips per model call
 DT_CANON = (0.0, 0.72, 1.15, 1.0)   # years between the canonical mosaic dates
 DATE_RE = None         # compiled lazily in _parse_date
@@ -98,10 +100,17 @@ def _softmax(x):
 
 
 # ---------------------------------------------------------------- IO helpers
+_DS_CACHE = {}
+
+
 def _gdal_open(path):
-    ds = gdal.Open(path)
+    """Cached GDAL dataset (opening a 14k x 7k tiled TIFF costs ~2-5 ms per band)."""
+    ds = _DS_CACHE.get(path)
     if ds is None:
-        raise IOError(f"Cannot open {path}")
+        ds = gdal.Open(path)
+        if ds is None:
+            raise IOError(f"Cannot open {path}")
+        _DS_CACHE[path] = ds
     return ds
 
 
@@ -288,11 +297,12 @@ def _parse_date(text):
     return (y, mo) if 1 <= mo <= 12 else None
 
 
-def _select_dates(n):
-    """At most MASK_T dates, first and last always kept (evenly spaced)."""
-    if n <= MASK_T:
+def _select_dates(n, cap=None):
+    """At most `cap` dates (default MASK_T), first and last always kept (evenly spaced)."""
+    cap = MASK_T if cap is None else cap
+    if n <= cap:
         return list(range(n))
-    idx = np.linspace(0, n - 1, MASK_T).round().astype(int)
+    idx = np.linspace(0, n - 1, cap).round().astype(int)
     return sorted({int(i) for i in idx})
 
 
@@ -347,34 +357,35 @@ def _series_read(mode, s, band_idx, label, c0, r0, w, h):
     return _read_stack(label, idx, c0, r0, w, h), None
 
 
-class MaskMiniModel:
-    """Binary change mask model (CNN encoder + bidirectional CfC, ONNX, fixed T=8)."""
+class MaskCtxModel:
+    """Context mask CfC (ONNX): feats + 3x3 context + valid + dt + doy -> logits (fixed T=8)."""
 
     def __init__(self, path, provider="cpu"):
         import onnxruntime as ort
-        self._ort = ort
         with open(path, "rb") as fh:
-            self._buf = fh.read()
-        providers = pick_providers(provider)
+            buf = fh.read()
         try:
-            self.sess = ort.InferenceSession(self._buf, providers=providers)
+            self.sess = ort.InferenceSession(buf, providers=pick_providers(provider))
         except Exception:
-            self.sess = ort.InferenceSession(self._buf, providers=["CPUExecutionProvider"])
-        self._cpu_only = self.sess.get_providers() == ["CPUExecutionProvider"]
+            self.sess = ort.InferenceSession(buf, providers=["CPUExecutionProvider"])
 
     @property
     def provider(self):
         return self.sess.get_providers()[0]
 
-    def run(self, vol, dt, doy):
-        """vol (B,T,6,32,32), dt (B,T), doy (B,T,3) -> (B,2) logits; pads to T=8."""
-        B, T = vol.shape[0], vol.shape[1]
-        if T < MASK_T:
-            pad = MASK_T - T
-            vol = np.concatenate([vol, np.zeros((B, pad, 6, 32, 32), np.float32)], 1)
+    def run(self, feats, ctx, valid, dt, doy):
+        """feats (M,T,256), ctx (M,T,3,3,256), valid (M,T,3,3) -> (M,2); pads to T=8."""
+        B, T = feats.shape[0], feats.shape[1]
+        if T < MASK_CTX_T:
+            pad = MASK_CTX_T - T
+            feats = np.concatenate([feats, np.zeros((B, pad, 256), np.float32)], 1)
+            ctx = np.concatenate([ctx, np.zeros((B, pad, 3, 3, 256), np.float32)], 1)
+            valid = np.concatenate([valid, np.zeros((B, pad, 3, 3), bool)], 1)
             dt = np.concatenate([dt, np.zeros((B, pad), np.float32)], 1)
             doy = np.concatenate([doy, np.zeros((B, pad, 3), np.float32)], 1)
-        return self.sess.run(None, {"vol": vol.astype(np.float32),
+        return self.sess.run(None, {"feats": feats.astype(np.float32),
+                                    "ctx": ctx.astype(np.float32),
+                                    "valid": valid.astype(np.float32),
                                     "dt": dt.astype(np.float32),
                                     "doy": doy.astype(np.float32)})[0]
 
@@ -401,28 +412,22 @@ class EncoderModel:
 
 
 class TypeCfCModel:
-    """TypeNet CfC (2 blocks x 256, ONNX): feats + dt + doy -> (M,3) logits (fixed T=8)."""
+    """TypeNet CfC with dynamic T (ONNX Loop): feats + dt + doy -> (M,3) logits.
+
+    Runs on CPU: the ONNX Loop operator produces wrong results on DirectML.
+    """
 
     def __init__(self, path, provider="cpu"):
         import onnxruntime as ort
         with open(path, "rb") as fh:
             buf = fh.read()
-        try:
-            self.sess = ort.InferenceSession(buf, providers=pick_providers(provider))
-        except Exception:
-            self.sess = ort.InferenceSession(buf, providers=["CPUExecutionProvider"])
+        self.sess = ort.InferenceSession(buf, providers=["CPUExecutionProvider"])
 
     @property
     def provider(self):
         return self.sess.get_providers()[0]
 
     def run(self, feats, dt, doy):
-        B, T = feats.shape[0], feats.shape[1]
-        if T < MASK_T:
-            pad = MASK_T - T
-            feats = np.concatenate([feats, np.zeros((B, pad, 768), np.float32)], 1)
-            dt = np.concatenate([dt, np.zeros((B, pad), np.float32)], 1)
-            doy = np.concatenate([doy, np.zeros((B, pad, 3), np.float32)], 1)
         return self.sess.run(None, {"feats": feats.astype(np.float32),
                                     "dt": dt.astype(np.float32),
                                     "doy": doy.astype(np.float32)})[0]
@@ -443,7 +448,7 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
     if mode != "period":
         s["series_files"] = list(files or []) or ([t1_path, t2_path] if t1_path else [])
     labels, dt_all, kind, paths = _series_for(s, mode, dates)
-    sel = _select_dates(len(labels))
+    sel = _select_dates(len(labels), cap=MASK_CTX_T)
     labels = [labels[i] for i in sel]
     dt_sel = np.zeros(len(sel), np.float32)
     for k in range(1, len(sel)):
@@ -457,49 +462,99 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
     ds = _create_raster(path, s["gt"], s["c0"], s["r0"], s["w"], s["h"], s["proj"])
     band = ds.GetRasterBand(1)
     tiles = _tiles(s["w"], s["h"])
-    model = MaskMiniModel(mask_model, provider)
+    enc_path = os.path.join(os.path.dirname(mask_model), "masknet_encoder.onnx")
+    if not os.path.exists(enc_path):
+        raise ValueError(f"Энкодер маски не найден рядом с моделью: {enc_path}")
+    enc = EncoderModel(enc_path, provider)
+    model = MaskCtxModel(mask_model, provider)
+    print(f"[forest_change] маска: энкодер {os.path.basename(enc_path)} + CfC "
+          f"{os.path.basename(mask_model)} (контекст 3x3)", flush=True)
     changed_chips = 0
     invalid_px = 0
     if progress:
         progress(1)
-    buf_vol, buf_dt, buf_doy, buf_pos = [], [], [], []
+    buf_f, buf_c, buf_v, buf_dt, buf_doy, buf_pos = [], [], [], [], [], []
+    HALO = CHIP
 
     def flush():
-        if not buf_vol:
+        if not buf_f:
             return
-        logits = model.run(np.stack(buf_vol), np.stack(buf_dt), np.stack(buf_doy))
+        logits = model.run(np.stack(buf_f), np.stack(buf_c), np.stack(buf_v),
+                           np.stack(buf_dt), np.stack(buf_doy))
         for j, (r, c) in enumerate(buf_pos):
             if int(np.argmax(logits[j])) == 1:
                 cells_changed.append((r, c))
-        buf_vol.clear(); buf_dt.clear(); buf_doy.clear(); buf_pos.clear()
+        buf_f.clear(); buf_c.clear(); buf_v.clear(); buf_dt.clear()
+        buf_doy.clear(); buf_pos.clear()
 
-    for ti, (x, y, tw, th) in enumerate(tiles):
+    cells_changed = []
+    ex = ThreadPoolExecutor(max_workers=1)
+
+    def read_series_box(x, y, tw, th):
+        """Read the extended series window (halo for the 3x3 context)."""
+        hx0 = x - HALO if x >= HALO else 0
+        hy0 = y - HALO if y >= HALO else 0
+        hx1 = min(s["w"], x + tw + HALO)
+        hy1 = min(s["h"], y + th + HALO)
+        ew, eh = hx1 - hx0, hy1 - hy0
+        reads = []
+        for label in labels:
+            bands, scl = _series_read(mode, s, band_idx, label,
+                                      s["c0"] + hx0, s["r0"] + hy0, ew, eh)
+            reads.append((bands, scl))
+        return hx0, hy0, ew, eh, reads
+
+    def process_tile(ti, x, y, tw, th, fut):
+        nonlocal changed_chips, invalid_px
+        hx0, hy0, ew, eh, reads = fut.result()
         out = np.zeros((th, tw), np.uint8)
         invalid = np.zeros((th, tw), bool)
+        nc, nr = ew // CHIP, eh // CHIP
+        ox, oy = x - hx0, y - hy0
+        grid = np.zeros((len(labels), nr, nc, 256), np.float32)
+        gvalid = np.zeros((len(labels), nr, nc), bool)
         series = []
-        for li, label in enumerate(labels):
-            bands, scl = _series_read(mode, s, band_idx, label, s["c0"] + x, s["r0"] + y, tw, th)
+        for li, (bands, scl) in enumerate(reads):
             series.append(bands)
             if scl is not None and li in (0, len(labels) - 1):
-                invalid |= np.isin(scl, SCL_INVALID)
-        first, last = series[0], series[-1]
-        invalid |= (first[3] == 0) | (last[3] == 0)
+                invalid |= np.isin(scl[oy:oy + th, ox:ox + tw], SCL_INVALID)
+            b = bands[:, :nr * CHIP, :nc * CHIP].astype(np.float32) / SCALE
+            chips = b.reshape(6, nr, CHIP, nc, CHIP).transpose(1, 3, 0, 2, 4)
+            chips = np.ascontiguousarray(chips).reshape(nr * nc, 6, CHIP, CHIP)
+            gvalid[li] = (chips.sum(axis=(1, 2, 3)) > 0).reshape(nr, nc)
+            f = np.empty((nr * nc, 256), np.float32)
+            for i0 in range(0, nr * nc, 128):
+                f[i0:i0 + 128] = enc.run(chips[i0:i0 + 128])
+            grid[li] = f.reshape(nr, nc, 256)
+        first_i = series[0][:, oy:oy + th, ox:ox + tw]
+        last_i = series[-1][:, oy:oy + th, ox:ox + tw]
+        invalid |= (first_i[3] == 0) | (last_i[3] == 0)
         if FOREST_NDVI_MIN > 0:
-            invalid |= (_ndvi(first) < FOREST_NDVI_MIN) & (_ndvi(last) < FOREST_NDVI_MIN)
-        cells_changed = []
-        n_before = len(cells_changed)
+            invalid |= (_ndvi(first_i) < FOREST_NDVI_MIN) & (_ndvi(last_i) < FOREST_NDVI_MIN)
+        cells_changed.clear()
         for r in range(0, th - CHIP + 1, CHIP):
+            gi = (y + r - hy0) // CHIP
             for c in range(0, tw - CHIP + 1, CHIP):
                 if invalid[r:r + CHIP, c:c + CHIP].mean() > 0.5:
                     continue
-                vol = np.zeros((len(series), 6, CHIP, CHIP), np.float32)
-                for li in range(len(series)):
-                    b = series[li][:, r:r + CHIP, c:c + CHIP].astype(np.float32) / SCALE
-                    vol[li] = np.clip(b, 0.0, 1.5)     # raw reflectance, as in training
-                buf_vol.append(vol); buf_dt.append(dt_sel.copy())
+                gj = (x + c - hx0) // CHIP
+                if gi < 0 or gj < 0 or gi >= nr or gj >= nc:
+                    continue
+                ctx = np.zeros((len(labels), 3, 3, 256), np.float32)
+                cvalid = np.zeros((len(labels), 3, 3), bool)
+                for dj in (-1, 0, 1):
+                    for di in (-1, 0, 1):
+                        a, b_ = gi + dj, gj + di
+                        if 0 <= a < nr and 0 <= b_ < nc:
+                            ctx[:, dj + 1, di + 1] = grid[:, a, b_]
+                            cvalid[:, dj + 1, di + 1] = gvalid[:, a, b_]
+                buf_f.append(grid[:, gi, gj])
+                buf_c.append(ctx)
+                buf_v.append(cvalid)
+                buf_dt.append(dt_sel.copy())
                 buf_doy.append(doy_sel.copy())
                 buf_pos.append((r, c))
-                if len(buf_vol) >= MASK_BATCH:
+                if len(buf_f) >= MASK_BATCH:
                     flush()
         flush()
         for (r, c) in cells_changed:
@@ -510,6 +565,16 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
         invalid_px += int(invalid.sum())
         if progress:
             progress(int(100 * (ti + 1) / len(tiles)))
+
+    prev = None
+    for ti, (x, y, tw, th) in enumerate(tiles):
+        fut = ex.submit(read_series_box, x, y, tw, th)
+        if prev is not None:
+            process_tile(*prev)
+        prev = (ti, x, y, tw, th, fut)
+    if prev is not None:
+        process_tile(*prev)
+    ex.shutdown()
     band = None
     ds = None
     px_area = s["gt"][1] * abs(s["gt"][5]) / 1e4
@@ -596,7 +661,8 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
     enc = EncoderModel(enc_path, provider)
     cfc = TypeCfCModel(model_path, provider)
     print(f"[forest_change] типы: TypeNet (энкодер {os.path.basename(enc_path)} + CfC "
-          f"{os.path.basename(model_path)}), {len(labels)} дат", flush=True)
+          f"{os.path.basename(model_path)}, динамическое T, CfC на CPU), {len(labels)} дат",
+          flush=True)
     cells = []
     tiles = _tiles(w, h)
     if progress:
@@ -634,6 +700,18 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
                 if len(buf_chips) >= 16:      # 16 chips x <=8 dates = 128 encoder rows
                     flush()
 
+    ex = ThreadPoolExecutor(max_workers=1)
+
+    def read_window(x, y, w):
+        sr0, sc0, sr1, sc1 = w
+        reads = []
+        for label in labels:
+            bands, scl = _series_read(mode, s, band_idx, label,
+                                      c0 + x + sc0, r0 + y + sr0,
+                                      sc1 - sc0, sr1 - sr0)
+            reads.append((bands, scl))
+        return reads
+
     for ti, (x, y, tw, th) in enumerate(tiles):
         out = np.zeros((th, tw), np.uint8)
         n_before = len(cells)
@@ -643,13 +721,14 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
             change = mt == 1
             invalid_tile = mt == 255
             if change.any():
-                windows = _mask_windows(change) if SUBTILE else [(0, 0, th, tw)]
-                for sr0, sc0, sr1, sc1 in windows:
+                windows = list(_mask_windows(change) if SUBTILE else [(0, 0, th, tw)])
+                fut = ex.submit(read_window, x, y, windows[0]) if windows else None
+                for wi, (sr0, sc0, sr1, sc1) in enumerate(windows):
+                    reads = fut.result()
+                    if wi + 1 < len(windows):
+                        fut = ex.submit(read_window, x, y, windows[wi + 1])
                     series, invalid = [], None
-                    for label in labels:
-                        bands, scl = _series_read(mode, s, band_idx, label,
-                                                  c0 + x + sc0, r0 + y + sr0,
-                                                  sc1 - sc0, sr1 - sr0)
+                    for bands, scl in reads:
                         series.append(bands)
                         if scl is not None:
                             inv = np.isin(scl, SCL_INVALID)
@@ -675,6 +754,7 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
         band.WriteArray(out, x, y)
         if progress:
             progress(int(100 * (ti + 1) / len(tiles)))
+    ex.shutdown()
     band = None
     ds_out = None
     if hasattr(cfc, "close"):
@@ -688,7 +768,8 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
     for k in (1, 2, 3):
         n_px[CLASSES[k]] = float(sum(1 for _, _, kk, _ in cells if kk == k) * CHIP * CHIP
                                  * gt[1] * abs(gt[5]) / 1e4)
-    summary = {"mode": mode, "period": period, "provider": cfc.provider,
+    summary = {"mode": mode, "period": period, "provider": enc.provider,
+               "cfc_provider": cfc.provider,
                "chip": CHIP, "tile_px": TILE_PX, "scale_m": gt[1], "change_thr": CHANGE_THR,
                "cells": len(cells),
                "used_mask": os.path.basename(mask_file) if use_mask else None,
