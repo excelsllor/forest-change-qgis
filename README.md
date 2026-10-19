@@ -36,7 +36,7 @@ macro-F1 0.870 на val, строго по маске). Геообработка
 Требуется QGIS 3.16+ (проверено на 3.44 LTR, Python 3.12).
 
 **Вариант A — из ZIP (рекомендуется):**
-1. скачайте `forest_change_plugin_v0.14.0.zip` из
+1. скачайте `forest_change_plugin_v0.14.1.zip` из
    [Releases плагина](https://github.com/excelsllor/forest-change-qgis/releases);
 2. QGIS → *Модули → Управление модулями → Установить из ZIP* → выберите файл;
 3. включите модуль «Forest Change Detection (DOFA+CfC)».
@@ -74,14 +74,17 @@ C:\Users\<user>\AppData\Local\Programs\OSGeo4W\apps\Python312\python.exe -m pip 
 (Режим **«Готовые периоды (мозаики)»** — для наших мозаик `<дата>_<band>.tif` с 4 каноническими датами.)
 
 **Ориентир (проверено на p3-мозаике, 2025-07→2026-06, 98 тайлов):** маска 14 087 чипов
-(144.3 тыс. га) за 53 с; типы для 13 376 клеток за 169 с (энкодер DirectML, CfC на CPU);
-выход — `classes.tif`, `changes.gpkg`, `cells.gpkg`.
+(144.3 тыс. га) за ~49 с; типы для 13 376 клеток — **177 с cold / 40 с warm** (кэш фич
+энкодера в `out_dir/cache`, энкодер DirectML, CfC на CPU); выход — `classes.tif`,
+`changes.gpkg`, `cells.gpkg`.
 
 **Если в логе появилось `provider ... failed, falling back to CPUExecutionProvider`** —
 это норма: плагин сам переключается на CPU, если выбранный провайдер не сработал.
 
-**Скорость:** маска ~0.5 с/тайл (кэш GDAL-хендлов + async-prefetch); типы ~12.6 мс/клетка
-(энкодер на DirectML ~2.4 мс/чип-дата, CfC на CPU). Для больших AOI выбирайте DirectML/CUDA.
+**Скорость:** маска ~0.5 с/тайл (VRT 6-в-1 + кэш GDAL-хендлов + async-prefetch);
+типы ~13 мс/клетка cold (энкодер DirectML ~2.4 мс/чип-дата, CfC на CPU) и **~3 мс/клетка
+на повторном прогоне** (дисковый кэш фич `out_dir/cache`, ключ = даты + энкодер + mtime данных).
+Для больших AOI выбирайте DirectML/CUDA.
 
 ## Точность
 

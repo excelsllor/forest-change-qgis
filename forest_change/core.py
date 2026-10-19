@@ -21,6 +21,7 @@ Input modes:
 Outputs in out_dir: mask.tif, classes.tif, changes.gpkg, cells.gpkg, summary.json
 """
 
+import hashlib
 import json
 import os
 import time
@@ -30,6 +31,7 @@ import numpy as np
 from osgeo import gdal, ogr, osr
 
 gdal.UseExceptions()
+gdal.SetConfigOption("GDAL_CACHEMAX", "512")   # keep decompressed 512x512 blocks hot
 
 CLASSES = {0: "no_change", 1: "logging", 2: "windfall", 3: "fire"}
 BANDS6 = ("B02", "B03", "B04", "B08", "B11", "B12")
@@ -161,19 +163,34 @@ def _read_stack(path, band_idx, c0, r0, w, h):
     return out
 
 
-def _read_mosaic6(mosaic_dir, date, c0, r0, w, h):
-    out = np.zeros((6, h, w), dtype=np.float32)
-    for i, b in enumerate(BANDS6):
-        p = os.path.join(mosaic_dir, f"{date}_{b}.tif")
+_VRT_CACHE = {}
+
+
+def _mosaic_vrt(mosaic_dir, date):
+    """In-memory 6-band VRT over <date>_<band>.tif (one GDAL call instead of six)."""
+    key = (os.path.abspath(mosaic_dir), date)
+    vrt = _VRT_CACHE.get(key)
+    if vrt is not None:
+        return vrt
+    srcs = [os.path.join(mosaic_dir, f"{date}_{b}.tif") for b in BANDS6]
+    for p in srcs:
         if not os.path.exists(p):
             raise ValueError(
                 f"В папке мозаик нет файла «{os.path.basename(p)}».\n"
                 f"Папка: {mosaic_dir}\nОжидаются файлы <дата>_<канал>.tif для каналов "
                 f"{', '.join(BANDS6)} и <дата>_SCL.tif по датам {', '.join(SEQ_DATES)}.")
-        ds = _gdal_open(p)
-        out[i] = ds.GetRasterBand(1).ReadAsArray(c0, r0, w, h)
-        del ds
-    return out
+    vrt = gdal.BuildVRT(f"/vsimem/fc_{abs(hash(key))}.vrt", srcs,
+                        options=gdal.BuildVRTOptions(separate=True))
+    _VRT_CACHE[key] = vrt
+    return vrt
+
+
+def _read_mosaic6(mosaic_dir, date, c0, r0, w, h):
+    vrt = _mosaic_vrt(mosaic_dir, date)
+    arr = vrt.ReadAsArray(c0, r0, w, h)
+    if arr is None:
+        raise IOError(f"Не удалось прочитать окно {w}x{h} ({date}) в мозаике {mosaic_dir}")
+    return arr
 
 
 def guess_band_idx(path):
@@ -473,19 +490,20 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
     invalid_px = 0
     if progress:
         progress(1)
-    buf_f, buf_c, buf_v, buf_dt, buf_doy, buf_pos = [], [], [], [], [], []
+    buf = []
     HALO = CHIP
 
     def flush():
-        if not buf_f:
-            return
-        logits = model.run(np.stack(buf_f), np.stack(buf_c), np.stack(buf_v),
-                           np.stack(buf_dt), np.stack(buf_doy))
-        for j, (r, c) in enumerate(buf_pos):
-            if int(np.argmax(logits[j])) == 1:
-                cells_changed.append((r, c))
-        buf_f.clear(); buf_c.clear(); buf_v.clear(); buf_dt.clear()
-        buf_doy.clear(); buf_pos.clear()
+        for feats, ctx, cval, dtb, doyb, pos in buf:
+            n = len(feats)
+            for i0 in range(0, n, 256):
+                logits = model.run(feats[i0:i0 + 256], ctx[i0:i0 + 256],
+                                   cval[i0:i0 + 256], dtb[i0:i0 + 256],
+                                   doyb[i0:i0 + 256])
+                for j in range(logits.shape[0]):
+                    if int(np.argmax(logits[j])) == 1:
+                        cells_changed.append(pos[i0 + j])
+        buf.clear()
 
     cells_changed = []
     ex = ThreadPoolExecutor(max_workers=1)
@@ -532,30 +550,34 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
         if FOREST_NDVI_MIN > 0:
             invalid |= (_ndvi(first_i) < FOREST_NDVI_MIN) & (_ndvi(last_i) < FOREST_NDVI_MIN)
         cells_changed.clear()
-        for r in range(0, th - CHIP + 1, CHIP):
-            gi = (y + r - hy0) // CHIP
-            for c in range(0, tw - CHIP + 1, CHIP):
-                if invalid[r:r + CHIP, c:c + CHIP].mean() > 0.5:
-                    continue
-                gj = (x + c - hx0) // CHIP
-                if gi < 0 or gj < 0 or gi >= nr or gj >= nc:
-                    continue
-                ctx = np.zeros((len(labels), 3, 3, 256), np.float32)
-                cvalid = np.zeros((len(labels), 3, 3), bool)
+        nh, nw = th // CHIP, tw // CHIP
+        if nh and nw:
+            inv_frac = invalid[:nh * CHIP, :nw * CHIP].reshape(
+                nh, CHIP, nw, CHIP).mean(axis=(1, 3))
+            sel = np.argwhere(inv_frac <= 0.5)
+            if len(sel):
+                n = len(sel)
+                Tn = len(labels)
+                g0 = (y - hy0) // CHIP
+                gg0 = (x - hx0) // CHIP
+                rows = g0 + sel[:, 0]
+                cols = gg0 + sel[:, 1]
+                pad = np.zeros((Tn, nr + 2, nc + 2, 256), np.float32)
+                pad[:, 1:-1, 1:-1] = grid
+                pv = np.zeros((Tn, nr + 2, nc + 2), bool)
+                pv[:, 1:-1, 1:-1] = gvalid
+                feats = grid[:, rows, cols].transpose(1, 0, 2)          # (n,T,256)
+                ctx = np.empty((n, Tn, 3, 3, 256), np.float32)
+                cval = np.empty((n, Tn, 3, 3), bool)
                 for dj in (-1, 0, 1):
                     for di in (-1, 0, 1):
-                        a, b_ = gi + dj, gj + di
-                        if 0 <= a < nr and 0 <= b_ < nc:
-                            ctx[:, dj + 1, di + 1] = grid[:, a, b_]
-                            cvalid[:, dj + 1, di + 1] = gvalid[:, a, b_]
-                buf_f.append(grid[:, gi, gj])
-                buf_c.append(ctx)
-                buf_v.append(cvalid)
-                buf_dt.append(dt_sel.copy())
-                buf_doy.append(doy_sel.copy())
-                buf_pos.append((r, c))
-                if len(buf_f) >= MASK_BATCH:
-                    flush()
+                        ctx[:, :, dj + 1, di + 1] = pad[:, rows + dj + 1,
+                                                        cols + di + 1].transpose(1, 0, 2)
+                        cval[:, :, dj + 1, di + 1] = pv[:, rows + dj + 1,
+                                                         cols + di + 1].transpose(1, 0)
+                buf.append((feats, ctx, cval, np.tile(dt_sel, (n, 1)),
+                            np.tile(doy_sel, (n, 1, 1)),
+                            [(int(j) * CHIP, int(i) * CHIP) for j, i in sel]))
         flush()
         for (r, c) in cells_changed:
             out[r:r + CHIP, c:c + CHIP] = 1
@@ -660,6 +682,23 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
     doy_sel = np.stack([_doy3(l, year=(kind != "mosaic")) for l in labels])
     enc = EncoderModel(enc_path, provider)
     cfc = TypeCfCModel(model_path, provider)
+    _sig_src = (os.path.join(mosaic_dir, f"{labels[0]}_B04.tif") if mode == "period"
+                else (paths[0] if paths else ""))
+    _sig = os.path.getmtime(_sig_src) if _sig_src and os.path.exists(_sig_src) else 0
+    cache_key = hashlib.md5(
+        (os.path.abspath(model_path) + "|" + str(os.path.getmtime(model_path)) + "|" +
+         os.path.abspath(enc_path) + "|" + str(os.path.getmtime(enc_path)) + "|" +
+         str(_sig) + "|" + ",".join(map(str, labels))).encode()).hexdigest()[:16]
+    cache_dir = os.path.join(out_dir, "cache")
+    cache_path = os.path.join(cache_dir, f"type_feats_{cache_key}.npz")
+    fcache = {}
+    if os.path.exists(cache_path):
+        _zc = np.load(cache_path)
+        _zf = _zc["feats"][:]
+        _zk = _zc["keys"][:]
+        fcache = {(int(a), int(b)): _zf[i] for i, (a, b) in enumerate(_zk)}
+        print(f"[forest_change] кэш фич типов: {len(fcache)} чипов "
+              f"({os.path.basename(cache_path)})", flush=True)
     print(f"[forest_change] типы: TypeNet (энкодер {os.path.basename(enc_path)} + CfC "
           f"{os.path.basename(model_path)}, динамическое T, CfC на CPU), {len(labels)} дат",
           flush=True)
@@ -667,38 +706,63 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
     tiles = _tiles(w, h)
     if progress:
         progress(1)
-    buf_chips, buf_dt, buf_doy, buf_pos = [], [], [], []
+    pend = []
+    pend_n = [0]
 
     def flush():
-        if not buf_chips:
+        if not pend:
             return
-        chips = np.stack(buf_chips)                       # (M, D, 6, 32, 32)
+        chips = pend[0][0] if len(pend) == 1 else np.concatenate([p[0] for p in pend], 0)
+        dtb = pend[0][1] if len(pend) == 1 else np.concatenate([p[1] for p in pend], 0)
+        doyb = pend[0][2] if len(pend) == 1 else np.concatenate([p[2] for p in pend], 0)
+        pos = [q for p in pend for q in p[3]]
         M, D = chips.shape[0], chips.shape[1]
-        feats = enc.run(chips.reshape(M * D, 6, 32, 32)).reshape(M, D, 768)
-        logits = cfc.run(feats, np.stack(buf_dt), np.stack(buf_doy))
-        probs = _softmax(np.asarray(logits, dtype=np.float32))
-        for idx_cell, (rr, cc) in enumerate(buf_pos):
-            k = int(logits[idx_cell].argmax()) + 1       # 0/1/2 -> logging/windfall/fire
-            cells.append((rr, cc, k, float(probs[idx_cell, k - 1])))
-        buf_chips.clear(); buf_dt.clear(); buf_doy.clear(); buf_pos.clear()
+        keys = [(int(r0 + rr), int(c0 + cc)) for (rr, cc) in pos]
+        feats = np.empty((M, D, 768), np.float32)
+        miss = [i for i, k_ in enumerate(keys) if k_ not in fcache]
+        if miss:
+            flat = chips[miss].reshape(len(miss) * D, 6, CHIP, CHIP)
+            mf = np.empty((len(miss) * D, 768), np.float32)
+            for i0 in range(0, len(miss) * D, 256):
+                mf[i0:i0 + 256] = enc.run(flat[i0:i0 + 256])
+            mf = mf.reshape(len(miss), D, 768)
+            for j, mi in enumerate(miss):
+                feats[mi] = mf[j]
+                fcache[keys[mi]] = mf[j].astype(np.float16)
+        for i, k_ in enumerate(keys):
+            if k_ not in miss and i not in miss:
+                feats[i] = fcache[k_]
+        for i0 in range(0, M, 256):
+            logits = cfc.run(feats[i0:i0 + 256], dtb[i0:i0 + 256], doyb[i0:i0 + 256])
+            probs = _softmax(np.asarray(logits, dtype=np.float32))
+            for j in range(logits.shape[0]):
+                k = int(logits[j].argmax()) + 1       # 0/1/2 -> logging/windfall/fire
+                rr, cc = pos[i0 + j]
+                cells.append((rr, cc, k, float(probs[j, k - 1])))
+        pend.clear(); pend_n[0] = 0
 
     def process_window(ax, ay, series, change):
         """Classify the changed chips of one read sub-window (series = per-date (6,h,w))."""
+        D = len(series)
         th_sub, tw_sub = change.shape
-        for r in range(0, th_sub - CHIP + 1, CHIP):
-            for c in range(0, tw_sub - CHIP + 1, CHIP):
-                frac = float(change[r:r + CHIP, c:c + CHIP].mean())
-                if frac < CHANGE_FRAC:
-                    continue
-                chips = np.zeros((len(series), 6, CHIP, CHIP), np.float32)
-                for li in range(len(series)):
-                    chips[li] = series[li][:, r:r + CHIP, c:c + CHIP] / SCALE
-                buf_chips.append(chips)
-                buf_dt.append(dt_sel.copy())
-                buf_doy.append(doy_sel.copy())
-                buf_pos.append((ay + r, ax + c))
-                if len(buf_chips) >= 16:      # 16 chips x <=8 dates = 128 encoder rows
-                    flush()
+        nh, nw = th_sub // CHIP, tw_sub // CHIP
+        if nh == 0 or nw == 0:
+            return
+        frac = change[:nh * CHIP, :nw * CHIP].reshape(nh, CHIP, nw, CHIP).mean(axis=(1, 3))
+        sel = np.argwhere(frac >= CHANGE_FRAC)
+        if len(sel) == 0:
+            return
+        chips = np.empty((len(sel), D, 6, CHIP, CHIP), np.float32)
+        for li in range(D):
+            b = series[li][:, :nh * CHIP, :nw * CHIP].astype(np.float32) / SCALE
+            arr = b.reshape(6, nh, CHIP, nw, CHIP).transpose(1, 3, 0, 2, 4)
+            chips[:, li] = arr[sel[:, 0], sel[:, 1]]
+        pend.append((chips, np.tile(dt_sel, (len(sel), 1)),
+                     np.tile(doy_sel, (len(sel), 1, 1)),
+                     [(ay + int(j) * CHIP, ax + int(i) * CHIP) for j, i in sel]))
+        pend_n[0] += len(sel)
+        if pend_n[0] >= 16:
+            flush()
 
     ex = ThreadPoolExecutor(max_workers=1)
 
@@ -755,6 +819,13 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
         if progress:
             progress(int(100 * (ti + 1) / len(tiles)))
     ex.shutdown()
+    if fcache:
+        os.makedirs(cache_dir, exist_ok=True)
+        _ck = np.array(list(fcache.keys()), np.int32)
+        _cf = np.stack([fcache[k_] for k_ in fcache]).astype(np.float16)
+        np.savez(cache_path, keys=_ck, feats=_cf)
+        print(f"[forest_change] кэш фич типов сохранён: {len(fcache)} чипов "
+              f"({os.path.getsize(cache_path) / 1e6:.0f} МБ)", flush=True)
     band = None
     ds_out = None
     if hasattr(cfc, "close"):
