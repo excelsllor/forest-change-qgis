@@ -51,7 +51,7 @@ C:\Users\<user>\AppData\Local\Programs\OSGeo4W\apps\Python312\python.exe -m pip 
 # опционально GPU: -m pip install onnxruntime-directml
 ```
 
-**Модели (48 МБ) входят в ZIP:** `masknet_v2_cfc.onnx` (6.9 МБ), `typenet_encoder.onnx` (30.4 МБ),
+**Модели (49 МБ) входят в ZIP:** `masknet_v2_cfc.onnx` (7.6 МБ), `typenet_encoder.onnx` (30.4 МБ),
 `typenet_cfc.onnx` (11.0 МБ). Legacy-модель `forest_change_fusion128.onnx` (426 МБ, старая версия)
 в ZIP не входит — при желании скачайте из Releases моделей. Чекпоинты для дообучения —
 в репозитории [forest-change-model](https://github.com/excelsllor/forest-change-model) (v2.0).
@@ -72,8 +72,8 @@ C:\Users\<user>\AppData\Local\Programs\OSGeo4W\apps\Python312\python.exe -m pip 
 
 (Режим **«Готовые периоды (мозаики)»** — для наших мозаик `<дата>_<band>.tif` с 4 каноническими датами.)
 
-**Ориентир (проверено на p3-мозаике, 2025-07→2026-06, 98 тайлов):** маска 20 269 чипов
-(207.6 тыс. га) за 93 с; типы для 19 504 клеток за 374 с (DirectML); выход — `classes.tif`,
+**Ориентир (проверено на p3-мозаике, 2025-07→2026-06, 98 тайлов):** маска 45 698 чипов
+(467.9 тыс. га) за 92 с; типы для 43 720 клеток за 749 с (DirectML); выход — `classes.tif`,
 `changes.gpkg`, `cells.gpkg`.
 
 **Если в логе появилось `provider ... failed, falling back to CPUExecutionProvider`** —
@@ -84,13 +84,14 @@ C:\Users\<user>\AppData\Local\Programs\OSGeo4W\apps\Python312\python.exe -m pip 
 
 ## Точность
 
-**Маска изменения (бинарно, MaskNet-v2 bicfcpn_big):**
+**Маска изменения (бинарно, MaskNet-v2 bicfcpn_big + голова со сводками):**
 
 | метрика | значение |
 |---|---|
-| val F1 (смешанный пул) | **0.917** |
-| организаторы (held-out кварталы) | 0.825 (P 0.971 / R 0.718), p1/p2/p3 0.697/0.918/0.840 |
-| каналы C=6 / 5 (без B12) / 4 | 0.825 / 0.780 / 0.856 |
+| val F1 (смешанный пул) | **0.916** |
+| организаторы (held-out кварталы) | **0.887** (P 0.906 / R 0.869), p1/p2/p3 0.846/0.908/0.903 |
+| каналы C=6 / 5 (без B12) / 4 | 0.887 / 0.856 / 0.882 |
+| zero-vol (без снимков) | 0.008 — решения полностью из изображений |
 | скорость (256 чипов) | GPU 339 мс, CPU 3.85 с |
 
 **Тип изменения (TypeNet, строго по маске; val, macro по присутствующим классам):**
