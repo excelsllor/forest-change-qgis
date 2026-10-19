@@ -4,8 +4,8 @@
 Sentinel-2. **Маску изменения считает нейросеть** (компактная модель CNN +
 двунаправленный CfC, бинарно «есть/нет», val F1 0.917, работает с 2–8 датами),
 а тип изменения (вырубка/ветровал/пожар) классифицирует **TypeNet**
-(дистиллированный DOFA-энкодер 12×768 + CfC 2×256, macro-F1 0.859 на val,
-строго по маске). Геообработка — GDAL/OGR, инференс — onnxruntime
+(дистиллированный DOFA-энкодер 12×768 + CfC 2×256, голова со сводками mean/last−first,
+macro-F1 0.870 на val, строго по маске). Геообработка — GDAL/OGR, инференс — onnxruntime
 (CPU или DirectML/CUDA, при ошибке — авто-откат на CPU).
 
 ## Как работает
@@ -51,8 +51,8 @@ C:\Users\<user>\AppData\Local\Programs\OSGeo4W\apps\Python312\python.exe -m pip 
 # опционально GPU: -m pip install onnxruntime-directml
 ```
 
-**Модели (46 МБ) входят в ZIP:** `masknet_v2_cfc.onnx` (6.9 МБ), `typenet_encoder.onnx` (30.4 МБ),
-`typenet_cfc.onnx` (9.0 МБ). Legacy-модель `forest_change_fusion128.onnx` (426 МБ, старая версия)
+**Модели (48 МБ) входят в ZIP:** `masknet_v2_cfc.onnx` (6.9 МБ), `typenet_encoder.onnx` (30.4 МБ),
+`typenet_cfc.onnx` (11.0 МБ). Legacy-модель `forest_change_fusion128.onnx` (426 МБ, старая версия)
 в ZIP не входит — при желании скачайте из Releases моделей. Чекпоинты для дообучения —
 в репозитории [forest-change-model](https://github.com/excelsllor/forest-change-model) (v2.0).
 
@@ -73,7 +73,7 @@ C:\Users\<user>\AppData\Local\Programs\OSGeo4W\apps\Python312\python.exe -m pip 
 (Режим **«Готовые периоды (мозаики)»** — для наших мозаик `<дата>_<band>.tif` с 4 каноническими датами.)
 
 **Ориентир (проверено на p3-мозаике, 2025-07→2026-06, 98 тайлов):** маска 20 269 чипов
-(207.6 тыс. га) за 90 с; типы для 19 504 клеток за 378 с (DirectML); выход — `classes.tif`,
+(207.6 тыс. га) за 93 с; типы для 19 504 клеток за 374 с (DirectML); выход — `classes.tif`,
 `changes.gpkg`, `cells.gpkg`.
 
 **Если в логе появилось `provider ... failed, falling back to CPUExecutionProvider`** —
@@ -97,13 +97,14 @@ C:\Users\<user>\AppData\Local\Programs\OSGeo4W\apps\Python312\python.exe -m pip 
 
 | источник | macro-F1 | примечание |
 |---|---|---|
-| все (log/wind/fire) | **0.837** (0.860 / 0.913 / 0.961) | 9 875 val-сэмплов, честные фичи (фикс big4) |
-| big4 (DISFOR) | 0.849 | 0.807 / 0.858 / 0.881 |
-| california (пожар) | 0.950 | |
-| vozh | 0.422 | слабое место — windfall (0.47) |
+| все (log/wind/fire) | **0.870** (0.922 / 0.877 / 0.983) | 9 875 val-сэмплов, голова со сводками |
+| big4 (DISFOR) | 0.860 | 0.816 / 0.830 / 0.934 |
+| california (пожар) | 0.972 | |
+| vozh | 0.547 | log 0.944 / wind **0.698** |
+| pairs / long | 0.920 / 0.939 | |
 
 **Сквозная проверка на GT-чипах p3** (dataset.csv через ONNX-пайплайн плагина):
-recall logging 78% / windfall 98%. `no_change` не классифицируется (его отсекает маска),
+recall logging **88.1%** / windfall **93.6%**. `no_change` не классифицируется (его отсекает маска),
 поэтому на ложных срабатываниях маски тип по умолчанию «windfall» — итоговая доля классов
 на карте зависит от порога маски.
 
@@ -111,8 +112,8 @@ recall logging 78% / windfall 98%. `no_change` не классифицирует
 
 - Маска не откалибрована по порогу (P 0.971 / R 0.718 на организаторах) — для повышения
   полноты можно понизить порог логита (argmax → diff > τ).
-- Vozh windfall у TypeNet слабый (0.42–0.52): редкий класс в обучении; альтернативный
-  чекпоинт `typenet_big_w256_b2_vozhft_mix.pth` (wind 0.517, big4 0.854) лежит в репозитории моделей.
+- Vozh windfall у TypeNet — 0.698 (было 0.474): вытянут головой со сводками; при желании можно
+  дообучить под vozh (`ft_typenet_vozh.py` от честной базы).
 - На ложных срабатываниях маски TypeNet отвечает «windfall» (no_change не обучен) —
   редкие типы на карте чувствительны к порогу маски.
 
