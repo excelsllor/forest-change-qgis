@@ -73,7 +73,7 @@ C:\Users\<user>\AppData\Local\Programs\OSGeo4W\apps\Python312\python.exe -m pip 
 (Режим **«Готовые периоды (мозаики)»** — для наших мозаик `<дата>_<band>.tif` с 4 каноническими датами.)
 
 **Ориентир (проверено на p3-мозаике, 2025-07→2026-06, 98 тайлов):** маска 20 269 чипов
-(207.6 тыс. га) за 100 с; типы для 19 504 клеток за 373 с (DirectML); выход — `classes.tif`,
+(207.6 тыс. га) за 90 с; типы для 19 504 клеток за 378 с (DirectML); выход — `classes.tif`,
 `changes.gpkg`, `cells.gpkg`.
 
 **Если в логе появилось `provider ... failed, falling back to CPUExecutionProvider`** —
@@ -97,13 +97,13 @@ C:\Users\<user>\AppData\Local\Programs\OSGeo4W\apps\Python312\python.exe -m pip 
 
 | источник | macro-F1 | примечание |
 |---|---|---|
-| все (log/wind/fire) | **0.859** (0.814 / 0.831 / 0.933) | 9 875 val-сэмплов |
-| big4 (DISFOR) | 0.875 | |
-| california (пожар) | 0.962 | |
-| vozh | 0.404 | слабое место — windfall (0.42–0.52) |
+| все (log/wind/fire) | **0.837** (0.860 / 0.913 / 0.961) | 9 875 val-сэмплов, честные фичи (фикс big4) |
+| big4 (DISFOR) | 0.849 | 0.807 / 0.858 / 0.881 |
+| california (пожар) | 0.950 | |
+| vozh | 0.422 | слабое место — windfall (0.47) |
 
 **Сквозная проверка на GT-чипах p3** (dataset.csv через ONNX-пайплайн плагина):
-recall logging 86% / windfall 97%. `no_change` не классифицируется (его отсекает маска),
+recall logging 78% / windfall 98%. `no_change` не классифицируется (его отсекает маска),
 поэтому на ложных срабатываниях маски тип по умолчанию «windfall» — итоговая доля классов
 на карте зависит от порога маски.
 
