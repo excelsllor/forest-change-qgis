@@ -35,7 +35,7 @@ macro-F1 0.870 на val, строго по маске). Геообработка
 Требуется QGIS 3.16+ (проверено на 3.44 LTR, Python 3.12).
 
 **Вариант A — из ZIP (рекомендуется):**
-1. скачайте `forest_change_plugin_v0.12.1.zip` из
+1. скачайте `forest_change_plugin_v0.13.0.zip` из
    [Releases плагина](https://github.com/excelsllor/forest-change-qgis/releases);
 2. QGIS → *Модули → Управление модулями → Установить из ZIP* → выберите файл;
 3. включите модуль «Forest Change Detection (DOFA+CfC)».
