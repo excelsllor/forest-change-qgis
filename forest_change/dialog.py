@@ -19,13 +19,12 @@ except AttributeError:  # Qt5
 from . import periods
 
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model")
-DEFAULT_MODEL = os.path.join(MODEL_DIR, "forest_change_fusion128.onnx")
-DEFAULT_MASK_MODEL = os.path.join(MODEL_DIR, "mask_mini3d.onnx")
+DEFAULT_MODEL = os.path.join(MODEL_DIR, "typenet_cfc.onnx")
+DEFAULT_MASK_MODEL = os.path.join(MODEL_DIR, "masknet_v2_cfc.onnx")
 BANDS6 = ("B02", "B03", "B04", "B08", "B11", "B12")
 SETTINGS = "forest_change"
 DATE_RE = re.compile(r"(20\d{2})[-_./]?(\d{2})(?:[-_./]?(\d{2}))?")
-PROVIDERS = [("Авто", "auto"), ("CPU", "cpu"), ("CUDA", "cuda"),
-             ("DirectML", "dml"), ("ROCm (torch, GPU)", "rocm_torch")]
+PROVIDERS = [("Авто", "auto"), ("CPU", "cpu"), ("CUDA", "cuda"), ("DirectML", "dml")]
 
 
 def parse_date(text):
@@ -139,7 +138,7 @@ class ForestChangeDialog(QDialog):
         self.bar = QProgressBar()
         root.addWidget(self.bar)
 
-        b_mask = QPushButton("1. Посчитать маску (алгоритм NDVI/NBR)")
+        b_mask = QPushButton("1. Посчитать маску (модель)")
         b_mask.clicked.connect(self._run_mask)
         root.addWidget(b_mask)
         b_types = QPushButton("2. Посчитать изменение по маске (модель)")
@@ -376,7 +375,7 @@ class ForestChangeDialog(QDialog):
         self._save()
         try:
             from . import core
-            self.status.setText("Считаю маску (алгоритм)…")
+            self.status.setText("Считаю маску (модель)…")
             self.bar.setValue(0)
             QApplication.setOverrideCursor(_WAIT_CURSOR)
             summary = core.compute_mask("files" if self._mode() == "slots" else "period",

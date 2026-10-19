@@ -1,26 +1,22 @@
-"""Core inference for the Forest Change QGIS plugin (DOFA + CfC fusion, CPU).
+"""Core inference for the Forest Change QGIS plugin (distilled CNN + CfC, CPU).
 
 TILED pipeline: the AOI is processed in windows (TILE_PX, a multiple of CHIP), so
 only a fragment of each date is held in RAM at a time (bounded ~0.3 GB for 1024 px
 tiles regardless of the raster size).
 
-Change is decided by the ALGORITHM (per-pixel |dNDVI|/|dNBR| gate); the network
-only classifies the TYPE of the changed 32 px (320 m) chips.
+  1) compute_mask()  - MaskNet-v2 (CNN + bidirectional CfC) -> mask.tif (1/0/255)
+  2) predict()       - TypeNet: per-date chips -> encoder -> CfC -> logging/windfall/fire;
+                       reuses mask.tif (tiles without changes are skipped without reads)
 
-  1) compute_mask()  - algorithmic change mask only -> mask.tif (1/0/255), no model
-  2) predict()       - type classification of the changed chips; reuses mask.tif if
-                       present (tiles without changes are skipped without reading)
-
-Model inputs (batch of 32 px chips):
-  pre, post : (B, 6, 128, 128) - bands B02,B03,B04,B08,B11,B12, reflectance/10000
-  seq       : (B, 4, 9)        - 9 features (6 bands + NDVI/NBR/NDMI) for the four
-                                 canonical dates, mean-pooled over the chip
-Output: 4 logits - no_change / logging / windfall / fire
+Model inputs (raw reflectance/10000, clipped to 0..1.5 as in training):
+  mask: vol (B,T,6,32,32), dt (B,T) years between consecutive kept dates,
+        doy (B,T,3) = (sin, cos, year-2015); T<=8, zero padded to 8
+  types: chips (M,6,32,32) -> typenet_encoder.onnx -> feats (M,768);
+         feats + dt + doy -> typenet_cfc.onnx -> 3 logits (no no_change class)
 
 Input modes:
   period  - mosaics stored as <date>_<band>.tif (+ <date>_SCL.tif) in a folder
-  files   - two multi-band GeoTIFFs (T1, T2) with 6 selected band numbers
-            (seq then uses only these two dates, remaining slots are zeros)
+  files   - multi-band GeoTIFFs (one per date, or T1/T2) with 6 band numbers
 
 Outputs in out_dir: mask.tif, classes.tif, changes.gpkg, cells.gpkg, summary.json
 """
@@ -51,8 +47,6 @@ PROVIDER_MAP = {
     "rocm": ["ROCMExecutionProvider", "CPUExecutionProvider"],
 }
 CHIP = 32          # 320 m at 10 m resolution (same scale as the training chips)
-SIZE = 128         # model input
-BATCH = 64
 SCALE = 10000.0
 MASK_T = 8             # fixed sequence length of the exported mask ONNX (zero padding)
 MASK_BATCH = 128       # chips per model call
@@ -81,17 +75,6 @@ def pick_providers(preferred="auto"):
     return got
 
 
-def _resize_bilinear(a, size):
-    """a: (C,H,W) -> (C,size,size) bilinear (numpy only, works in QGIS Python)."""
-    C, H, W = a.shape
-    xi = np.linspace(0, W - 1, size)
-    yi = np.linspace(0, H - 1, size)
-    x0 = np.floor(xi).astype(int); x1 = np.minimum(x0 + 1, W - 1); wx = (xi - x0)[None, None, :]
-    y0 = np.floor(yi).astype(int); y1 = np.minimum(y0 + 1, H - 1); wy = (yi - y0)[None, :, None]
-    tmp = a[:, :, x0] * (1 - wx) + a[:, :, x1] * wx
-    return tmp[:, y0, :] * (1 - wy) + tmp[:, y1, :] * wy
-
-
 def _ndvi(bands):
     """NDVI from a (6,h,w) reflectance window (band order B02,B03,B04,B08,B11,B12)."""
     b04 = bands[2].astype(np.float32)
@@ -112,131 +95,6 @@ def _features9(bands):
 def _softmax(x):
     e = np.exp(x - x.max(axis=1, keepdims=True))
     return e / e.sum(axis=1, keepdims=True)
-
-
-class Model:
-    def __init__(self, path, provider="auto"):
-        import onnxruntime as ort
-        self._ort = ort
-        with open(path, "rb") as fh:
-            self._buf = fh.read()
-        providers = pick_providers(provider)
-        try:
-            self.sess = ort.InferenceSession(self._buf, providers=providers)
-        except Exception:
-            self.sess = ort.InferenceSession(self._buf, providers=["CPUExecutionProvider"])
-        self._cpu_only = self.sess.get_providers() == ["CPUExecutionProvider"]
-
-    @property
-    def provider(self):
-        return self.sess.get_providers()[0]
-
-    def _infer(self):
-        return self.sess.run(None, {"pre": self._pre, "post": self._post, "seq": self._seq})[0]
-
-    def run(self, pre, post, seq):
-        self._pre, self._post, self._seq = pre, post, seq
-        try:
-            return self._infer()
-        except Exception as exc:  # noqa: BLE001  (e.g. DirectML fails on dynamic Reshape)
-            if self._cpu_only:
-                raise
-            print(f"[forest_change] provider {self.provider} failed ({type(exc).__name__}), "
-                  "falling back to CPUExecutionProvider", flush=True)
-            self.sess = self._ort.InferenceSession(self._buf, providers=["CPUExecutionProvider"])
-            self._cpu_only = True
-            return self._infer()
-
-
-ROCM_PY = os.environ.get("FC_ROCM_PY",
-                         r"D:\comfyui\Data\Packages\ComfyUI\venv\Scripts\python.exe")
-ROCM_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rocm_worker.py")
-
-
-class RocmModel:
-    """GPU inference via a persistent torch/ROCm worker subprocess (AMD on Windows)."""
-
-    def __init__(self, model_path, out_dir, timeout=900):
-        import subprocess
-        if not os.path.exists(ROCM_PY):
-            raise FileNotFoundError(f"ROCm python not found: {ROCM_PY}")
-        if not os.path.exists(ROCM_WORKER):
-            raise FileNotFoundError(f"worker not found: {ROCM_WORKER}")
-        self._model_path = model_path
-        self._cpu = None
-        self._io = os.path.join(out_dir, "_rocm_io.npz")
-        self._proc = subprocess.Popen(
-            [ROCM_PY, ROCM_WORKER], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
-            cwd=os.path.dirname(ROCM_WORKER))
-        t0 = time.time()
-        while time.time() - t0 < timeout:
-            line = self._proc.stdout.readline()
-            if not line:
-                raise RuntimeError("ROCm-воркер завершился при загрузке модели")
-            if line.startswith("READY"):
-                name = line.split("name=")[-1].strip() if "name=" in line else "GPU"
-                self._device = f"ROCm (torch, {name})"
-                break
-            print(f"[forest_change] rocm: {line.strip()}", flush=True)
-        else:
-            raise RuntimeError("ROCm-воркер: таймаут загрузки модели")
-        print(f"[forest_change] {self._device}", flush=True)
-
-    @property
-    def provider(self):
-        if self._cpu is not None:
-            return "CPUExecutionProvider (ROCm fallback)"
-        return self._device
-
-    def run(self, pre, post, seq):
-        if self._cpu is not None:
-            return self._cpu.run(pre, post, seq)
-        try:
-            np.savez(self._io, pre=pre.astype(np.float32), post=post.astype(np.float32),
-                     seq=seq.astype(np.float32))
-            self._proc.stdin.write(self._io + "\n")
-            self._proc.stdin.flush()
-            line = self._proc.stdout.readline()
-            if not line.startswith("OK"):
-                raise RuntimeError(f"ROCm-воркер: {line.strip()[:200]}")
-            with np.load(self._io + ".out.npz") as z:
-                return z["logits"]
-        except Exception as exc:  # noqa: BLE001  (GPU hang / driver reset / worker crash)
-            print(f"[forest_change] ROCm-воркер упал ({type(exc).__name__}: {str(exc)[:120]}), "
-                  "перехожу на onnxruntime CPU", flush=True)
-            self.close()
-            self._cpu = Model(self._model_path, "cpu")
-            return self._cpu.run(pre, post, seq)
-
-    def close(self):
-        try:
-            self._proc.stdin.write("exit\n")
-            self._proc.stdin.flush()
-            self._proc.wait(timeout=10)
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            self._proc.kill()
-        except Exception:  # noqa: BLE001
-            pass
-        for p in (self._io, self._io + ".out.npz"):
-            try:
-                if os.path.exists(p):
-                    os.remove(p)
-            except OSError:
-                pass
-
-
-def _make_model(model_path, provider, out_dir):
-    """ROCm torch worker when requested and available, otherwise onnxruntime."""
-    if str(provider or "").lower() in ("rocm_torch", "torch", "rocm-gpu"):
-        try:
-            return RocmModel(model_path, out_dir)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[forest_change] ROCm-воркер недоступен ({type(exc).__name__}: "
-                  f"{str(exc)[:120]}), использую onnxruntime CPU", flush=True)
-    return Model(model_path, provider)
 
 
 # ---------------------------------------------------------------- IO helpers
@@ -383,56 +241,6 @@ def _tiles(w, h, tile=None):
     return out
 
 
-def _read_tile(s, mode, band_idx, c0, r0, w, h, with_seq=True):
-    """Read one window of both dates (+ the feature stack) and the invalid mask."""
-    if mode == "period":
-        try:
-            from . import periods
-        except Exception:
-            import periods
-        mosaic_dir = s["mosaic_dir"]
-        date1, date2 = periods.PERIOD_DATES[s["period"]]
-        A = _read_mosaic6(mosaic_dir, date1, c0, r0, w, h)
-        B = _read_mosaic6(mosaic_dir, date2, c0, r0, w, h)
-        if with_seq:
-            feats = []
-            for date in SEQ_DATES:
-                try:
-                    feats.append(_features9(_read_mosaic6(mosaic_dir, date, c0, r0, w, h)))
-                except Exception:
-                    feats.append(np.zeros((9, h, w), np.float32))
-            seq_map = np.stack(feats)                        # (4,9,h,w)
-        else:
-            seq_map = None
-        invalid = (A[3] == 0) | (B[3] == 0)
-        for date in (date1, date2):
-            p = os.path.join(mosaic_dir, f"{date}_SCL.tif")
-            if os.path.exists(p):
-                invalid |= np.isin(_read_band1(p, c0, r0, w, h), SCL_INVALID)
-    else:
-        idx = band_idx or (1, 2, 3, 4, 5, 6)
-        A = _read_stack(s["pre_path"], idx, c0, r0, w, h)
-        B = _read_stack(s["post_path"], idx, c0, r0, w, h)
-        if with_seq:
-            feats = []
-            for p in s["seq_paths"]:
-                if p:
-                    try:
-                        feats.append(_features9(_read_stack(p, idx, c0, r0, w, h)))
-                    except Exception:
-                        feats.append(np.zeros((9, h, w), np.float32))
-                else:
-                    feats.append(np.zeros((9, h, w), np.float32))
-            seq_map = np.stack(feats)
-        else:
-            seq_map = None
-        invalid = (A[3] == 0) | (B[3] == 0)
-    # non-forest filter: not vegetated on either date (urban, bare, cropland leftovers)
-    if FOREST_NDVI_MIN > 0:
-        invalid |= (_ndvi(A) < FOREST_NDVI_MIN) & (_ndvi(B) < FOREST_NDVI_MIN)
-    return A, B, seq_map, invalid
-
-
 def _gate(A, B, invalid, thr=None):
     """Algorithmic per-pixel change mask.
 
@@ -488,6 +296,21 @@ def _select_dates(n):
     return sorted({int(i) for i in idx})
 
 
+def _doy3(label, year=True):
+    """(sin DOY, cos DOY, year-2015) for a date label ('YYYY-MM' or a file path).
+
+    year=False for the canonical mosaics (the training series used year=0 there).
+    """
+    import datetime
+    ym = _parse_date(label)
+    if ym is None:
+        return np.zeros(3, np.float32)
+    y, m = ym
+    t = datetime.date(y, m, 15).timetuple().tm_yday
+    return np.array([np.sin(2 * np.pi * t / 365.0), np.cos(2 * np.pi * t / 365.0),
+                     (y - 2015.0) if year else 0.0], np.float32)
+
+
 def _series_for(s, mode, dates=None):
     """Selected dates of the series: (labels, dt_years, kind, paths).
 
@@ -524,42 +347,8 @@ def _series_read(mode, s, band_idx, label, c0, r0, w, h):
     return _read_stack(label, idx, c0, r0, w, h), None
 
 
-def _series_scene_stats(mode, s, band_idx, labels):
-    """Per-date med/MAD of the 9 features over the WHOLE scene (as in training).
-
-    Windows of 512 px are sampled across the full raster extent (independent of
-    the AOI), so the normalisation matches the training distribution.
-    """
-    if mode == "period":
-        first = os.path.join(s["mosaic_dir"], f"{labels[0]}_B04.tif")
-    else:
-        first = labels[0]
-    gt, W, H, _ = _grid_from(first)
-    win = 512
-    rng = np.random.default_rng(11)
-    spots = [(int(rng.integers(0, max(1, W - win))), int(rng.integers(0, max(1, H - win))))
-             for _ in range(6)] if (W > win and H > win) else [(0, 0)]
-    out = []
-    for label in labels:
-        vals = []
-        for (x, y) in spots:
-            w = min(win, W - x); h = min(win, H - y)
-            if w < 8 or h < 8:
-                continue
-            bands, _ = _series_read(mode, s, band_idx, label, x, y, w, h)
-            f = _features9(bands)
-            ok = (bands > 0).all(0)
-            if ok.sum() > 0:
-                vals.append(f[:, ok].T)
-        v = np.concatenate(vals)[::3] if vals else np.zeros((1, 9), np.float32)
-        med = np.median(v, 0)
-        mad = np.median(np.abs(v - med), 0) + 1e-6
-        out.append((med.astype(np.float32), mad.astype(np.float32)))
-    return out
-
-
 class MaskMiniModel:
-    """Binary change mask model (mini 3D-CNN + CfC, ONNX, fixed T=8, zero padding)."""
+    """Binary change mask model (CNN encoder + bidirectional CfC, ONNX, fixed T=8)."""
 
     def __init__(self, path, provider="cpu"):
         import onnxruntime as ort
@@ -577,17 +366,66 @@ class MaskMiniModel:
     def provider(self):
         return self.sess.get_providers()[0]
 
-    def run(self, vol, seq, dt):
-        """vol (B,T,6,32,32), seq (B,T,9), dt (B,T) -> (B,2) logits; pads to T=8."""
-        B, T = seq.shape[0], seq.shape[1]
+    def run(self, vol, dt, doy):
+        """vol (B,T,6,32,32), dt (B,T), doy (B,T,3) -> (B,2) logits; pads to T=8."""
+        B, T = vol.shape[0], vol.shape[1]
         if T < MASK_T:
             pad = MASK_T - T
             vol = np.concatenate([vol, np.zeros((B, pad, 6, 32, 32), np.float32)], 1)
-            seq = np.concatenate([seq, np.zeros((B, pad, 9), np.float32)], 1)
             dt = np.concatenate([dt, np.zeros((B, pad), np.float32)], 1)
+            doy = np.concatenate([doy, np.zeros((B, pad, 3), np.float32)], 1)
         return self.sess.run(None, {"vol": vol.astype(np.float32),
-                                    "seq": seq.astype(np.float32),
-                                    "dt": dt.astype(np.float32)})[0]
+                                    "dt": dt.astype(np.float32),
+                                    "doy": doy.astype(np.float32)})[0]
+
+
+class EncoderModel:
+    """Channel-agnostic CNN encoder (12 layers x 768, ONNX): chips -> per-date features."""
+
+    def __init__(self, path, provider="cpu"):
+        import onnxruntime as ort
+        with open(path, "rb") as fh:
+            buf = fh.read()
+        try:
+            self.sess = ort.InferenceSession(buf, providers=pick_providers(provider))
+        except Exception:
+            self.sess = ort.InferenceSession(buf, providers=["CPUExecutionProvider"])
+
+    @property
+    def provider(self):
+        return self.sess.get_providers()[0]
+
+    def run(self, chips):
+        """chips (M,6,32,32) raw reflectance -> (M,768)."""
+        return self.sess.run(None, {"vol": chips.astype(np.float32)})[0]
+
+
+class TypeCfCModel:
+    """TypeNet CfC (2 blocks x 256, ONNX): feats + dt + doy -> (M,3) logits (fixed T=8)."""
+
+    def __init__(self, path, provider="cpu"):
+        import onnxruntime as ort
+        with open(path, "rb") as fh:
+            buf = fh.read()
+        try:
+            self.sess = ort.InferenceSession(buf, providers=pick_providers(provider))
+        except Exception:
+            self.sess = ort.InferenceSession(buf, providers=["CPUExecutionProvider"])
+
+    @property
+    def provider(self):
+        return self.sess.get_providers()[0]
+
+    def run(self, feats, dt, doy):
+        B, T = feats.shape[0], feats.shape[1]
+        if T < MASK_T:
+            pad = MASK_T - T
+            feats = np.concatenate([feats, np.zeros((B, pad, 768), np.float32)], 1)
+            dt = np.concatenate([dt, np.zeros((B, pad), np.float32)], 1)
+            doy = np.concatenate([doy, np.zeros((B, pad, 3), np.float32)], 1)
+        return self.sess.run(None, {"feats": feats.astype(np.float32),
+                                    "dt": dt.astype(np.float32),
+                                    "doy": doy.astype(np.float32)})[0]
 
 
 def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_path=None,
@@ -595,8 +433,8 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
                  provider="auto", mask_model=None, dates=None):
     """Model-based change mask -> mask.tif (1 changed chip / 0 / 255).
 
-    The mini 3D-CNN + CfC model (mask_mini3d.onnx) processes the time series of
-    every 32 px chip (up to 8 dates, zero padded) and decides change/no-change.
+    MaskNet-v2 (bicfcpn_big ONNX) processes the raw-reflectance time series of every
+    32 px chip (up to 8 dates, zero padded) with dt (years) and doy (sin/cos/year).
     """
     if not mask_model or not os.path.exists(mask_model):
         raise ValueError(f"Модель маски не найдена: {mask_model}")
@@ -610,6 +448,8 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
     dt_sel = np.zeros(len(sel), np.float32)
     for k in range(1, len(sel)):
         dt_sel[k] = float(dt_all[sel[k - 1] + 1:sel[k] + 1].sum())
+    doy_sel = np.stack([_doy3(l, year=(kind != "mosaic")) for l in labels]) \
+        if labels else np.zeros((0, 3), np.float32)
     print(f"[forest_change] маска: {len(sel)} дат из {len(dt_all)} (первая/последняя сохранены), "
           f"модель {os.path.basename(mask_model)}", flush=True)
 
@@ -617,24 +457,21 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
     ds = _create_raster(path, s["gt"], s["c0"], s["r0"], s["w"], s["h"], s["proj"])
     band = ds.GetRasterBand(1)
     tiles = _tiles(s["w"], s["h"])
-    stats = _series_scene_stats(mode, s, band_idx, labels)
-    med9 = np.stack([m for m, _ in stats])                 # (T,9)
-    mad9 = np.stack([d for _, d in stats])
     model = MaskMiniModel(mask_model, provider)
     changed_chips = 0
     invalid_px = 0
     if progress:
         progress(1)
-    buf_vol, buf_seq, buf_dt, buf_pos = [], [], [], []
+    buf_vol, buf_dt, buf_doy, buf_pos = [], [], [], []
 
     def flush():
         if not buf_vol:
             return
-        logits = model.run(np.stack(buf_vol), np.stack(buf_seq), np.stack(buf_dt))
+        logits = model.run(np.stack(buf_vol), np.stack(buf_dt), np.stack(buf_doy))
         for j, (r, c) in enumerate(buf_pos):
             if int(np.argmax(logits[j])) == 1:
                 cells_changed.append((r, c))
-        buf_vol.clear(); buf_seq.clear(); buf_dt.clear(); buf_pos.clear()
+        buf_vol.clear(); buf_dt.clear(); buf_doy.clear(); buf_pos.clear()
 
     for ti, (x, y, tw, th) in enumerate(tiles):
         out = np.zeros((th, tw), np.uint8)
@@ -656,14 +493,11 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
                 if invalid[r:r + CHIP, c:c + CHIP].mean() > 0.5:
                     continue
                 vol = np.zeros((len(series), 6, CHIP, CHIP), np.float32)
-                seq = np.zeros((len(series), 9), np.float32)
                 for li in range(len(series)):
                     b = series[li][:, r:r + CHIP, c:c + CHIP].astype(np.float32) / SCALE
-                    vol[li] = (b - med9[li, :6, None, None]) / (1.4826 * mad9[li, :6, None, None])
-                    f = _features9(series[li][:, r:r + CHIP, c:c + CHIP])
-                    fn = (f - med9[li, :, None, None]) / (1.4826 * mad9[li, :, None, None])
-                    seq[li] = fn.mean(axis=(1, 2))
-                buf_vol.append(vol); buf_seq.append(seq); buf_dt.append(dt_sel.copy())
+                    vol[li] = np.clip(b, 0.0, 1.5)     # raw reflectance, as in training
+                buf_vol.append(vol); buf_dt.append(dt_sel.copy())
+                buf_doy.append(doy_sel.copy())
                 buf_pos.append((r, c))
                 if len(buf_vol) >= MASK_BATCH:
                     flush()
@@ -733,6 +567,8 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
     """Type classification of the changed chips (tiles without changes are skipped)."""
     os.makedirs(out_dir, exist_ok=True)
     s = _setup(mode, period, mosaic_dir, files, t1_path, t2_path, aoi_bbox)
+    if mode != "period":
+        s["series_files"] = list(files or []) or ([t1_path, t2_path] if t1_path else [])
     gt, proj, c0, r0, w, h = s["gt"], s["proj"], s["c0"], s["r0"], s["w"], s["h"]
     cls_path = os.path.join(out_dir, "classes.tif")
     ds_out = _create_raster(cls_path, gt, c0, r0, w, h, proj)
@@ -747,44 +583,55 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
         mgt, _, _, _ = _grid_from(mask_file)
         mask_dx = int(round((gt[0] + c0 * gt[1] - mgt[0]) / gt[1]))
         mask_dy = int(round((gt[3] + r0 * gt[5] - mgt[3]) / gt[5]))
-    model = _make_model(model_path, provider, out_dir)
+    enc_path = os.path.join(os.path.dirname(model_path), "typenet_encoder.onnx")
+    if not os.path.exists(enc_path):
+        raise ValueError(f"Энкодер типов не найден рядом с моделью: {enc_path}")
+    labels, dt_all, kind, paths = _series_for(s, mode, None)
+    sel = _select_dates(len(labels))
+    labels = [labels[i] for i in sel]
+    dt_sel = np.zeros(len(sel), np.float32)
+    for k in range(1, len(sel)):
+        dt_sel[k] = float(dt_all[sel[k - 1] + 1:sel[k] + 1].sum())
+    doy_sel = np.stack([_doy3(l, year=(kind != "mosaic")) for l in labels])
+    enc = EncoderModel(enc_path, provider)
+    cfc = TypeCfCModel(model_path, provider)
+    print(f"[forest_change] типы: TypeNet (энкодер {os.path.basename(enc_path)} + CfC "
+          f"{os.path.basename(model_path)}), {len(labels)} дат", flush=True)
     cells = []
     tiles = _tiles(w, h)
     if progress:
         progress(1)
-    buf_a, buf_b, buf_s, buf_pos = [], [], [], []
+    buf_chips, buf_dt, buf_doy, buf_pos = [], [], [], []
 
     def flush():
-        if not buf_a:
+        if not buf_chips:
             return
-        logits = model.run(np.stack(buf_a).astype(np.float32),
-                           np.stack(buf_b).astype(np.float32),
-                           np.stack(buf_s).astype(np.float32))
+        chips = np.stack(buf_chips)                       # (M, D, 6, 32, 32)
+        M, D = chips.shape[0], chips.shape[1]
+        feats = enc.run(chips.reshape(M * D, 6, 32, 32)).reshape(M, D, 768)
+        logits = cfc.run(feats, np.stack(buf_dt), np.stack(buf_doy))
         probs = _softmax(np.asarray(logits, dtype=np.float32))
         for idx_cell, (rr, cc) in enumerate(buf_pos):
-            k = int(logits[idx_cell].argmax())
-            if k == 0:      # network says "no change" but the gate says changed:
-                k = 1 + int(np.argmax(logits[idx_cell, 1:]))
-            cells.append((rr, cc, k, float(probs[idx_cell, k])))
-        buf_a.clear(); buf_b.clear(); buf_s.clear(); buf_pos.clear()
+            k = int(logits[idx_cell].argmax()) + 1       # 0/1/2 -> logging/windfall/fire
+            cells.append((rr, cc, k, float(probs[idx_cell, k - 1])))
+        buf_chips.clear(); buf_dt.clear(); buf_doy.clear(); buf_pos.clear()
 
-    def process_window(ax, ay, A, B, seq_map, change):
-        """Classify the changed chips of one read sub-window (ax, ay = AOI origin)."""
+    def process_window(ax, ay, series, change):
+        """Classify the changed chips of one read sub-window (series = per-date (6,h,w))."""
         th_sub, tw_sub = change.shape
         for r in range(0, th_sub - CHIP + 1, CHIP):
             for c in range(0, tw_sub - CHIP + 1, CHIP):
                 frac = float(change[r:r + CHIP, c:c + CHIP].mean())
                 if frac < CHANGE_FRAC:
                     continue
-                chip_a = A[:, r:r + CHIP, c:c + CHIP]
-                chip_b = B[:, r:r + CHIP, c:c + CHIP]
-                if chip_a.shape[1] < CHIP or chip_a.shape[2] < CHIP:
-                    continue
-                buf_a.append(_resize_bilinear(chip_a, SIZE) / SCALE)
-                buf_b.append(_resize_bilinear(chip_b, SIZE) / SCALE)
-                buf_s.append(seq_map[:, :, r:r + CHIP, c:c + CHIP].mean(axis=(2, 3)))
+                chips = np.zeros((len(series), 6, CHIP, CHIP), np.float32)
+                for li in range(len(series)):
+                    chips[li] = series[li][:, r:r + CHIP, c:c + CHIP] / SCALE
+                buf_chips.append(chips)
+                buf_dt.append(dt_sel.copy())
+                buf_doy.append(doy_sel.copy())
                 buf_pos.append((ay + r, ax + c))
-                if len(buf_a) >= BATCH:
+                if len(buf_chips) >= 16:      # 16 chips x <=8 dates = 128 encoder rows
                     flush()
 
     for ti, (x, y, tw, th) in enumerate(tiles):
@@ -796,22 +643,30 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
             change = mt == 1
             invalid_tile = mt == 255
             if change.any():
-                if SUBTILE:
-                    # minimal imagery reads: only the chip-aligned boxes around changes
-                    for sr0, sc0, sr1, sc1 in _mask_windows(change):
-                        A, B, seq_map, invalid = _read_tile(s, mode, band_idx,
-                                                            c0 + x + sc0, r0 + y + sr0,
-                                                            sc1 - sc0, sr1 - sr0, with_seq=True)
-                        process_window(x + sc0, y + sr0, A, B, seq_map,
-                                       change[sr0:sr1, sc0:sc1] & ~invalid)
-                else:
-                    A, B, seq_map, invalid = _read_tile(s, mode, band_idx, c0 + x, r0 + y,
-                                                        tw, th, with_seq=True)
-                    process_window(x, y, A, B, seq_map, change & ~invalid)
+                windows = _mask_windows(change) if SUBTILE else [(0, 0, th, tw)]
+                for sr0, sc0, sr1, sc1 in windows:
+                    series, invalid = [], None
+                    for label in labels:
+                        bands, scl = _series_read(mode, s, band_idx, label,
+                                                  c0 + x + sc0, r0 + y + sr0,
+                                                  sc1 - sc0, sr1 - sr0)
+                        series.append(bands)
+                        if scl is not None:
+                            inv = np.isin(scl, SCL_INVALID)
+                            invalid = inv if invalid is None else (invalid | inv)
+                    sub = change[sr0:sr1, sc0:sc1]
+                    if invalid is not None:
+                        sub = sub & ~invalid
+                    process_window(x + sc0, y + sr0, series, sub)
         else:
-            A, B, seq_map, invalid = _read_tile(s, mode, band_idx, c0 + x, r0 + y, tw, th,
-                                                with_seq=True)
-            process_window(x, y, A, B, seq_map, _gate(A, B, invalid))
+            series = []
+            for label in labels:
+                bands, _ = _series_read(mode, s, band_idx, label, c0 + x, r0 + y, tw, th)
+                series.append(bands)
+            A = series[0].astype(np.float32) / SCALE
+            B = series[-1].astype(np.float32) / SCALE
+            invalid = np.zeros((th, tw), bool)
+            process_window(x, y, series, _gate(A, B, invalid))
         flush()
         # write the classes of the cells found in this tile
         for (rr, cc, k, _conf) in cells[n_before:]:
@@ -822,8 +677,8 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
             progress(int(100 * (ti + 1) / len(tiles)))
     band = None
     ds_out = None
-    if hasattr(model, "close"):
-        model.close()
+    if hasattr(cfc, "close"):
+        cfc.close()
 
     gpkg = os.path.join(out_dir, "changes.gpkg")
     _polygonize(cls_path, gpkg, proj)
@@ -833,7 +688,7 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
     for k in (1, 2, 3):
         n_px[CLASSES[k]] = float(sum(1 for _, _, kk, _ in cells if kk == k) * CHIP * CHIP
                                  * gt[1] * abs(gt[5]) / 1e4)
-    summary = {"mode": mode, "period": period, "provider": model.provider,
+    summary = {"mode": mode, "period": period, "provider": cfc.provider,
                "chip": CHIP, "tile_px": TILE_PX, "scale_m": gt[1], "change_thr": CHANGE_THR,
                "cells": len(cells),
                "used_mask": os.path.basename(mask_file) if use_mask else None,

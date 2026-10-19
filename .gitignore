@@ -4,3 +4,6 @@ __pycache__/
 forest_change/model/*.onnx
 forest_change/model/*.pth
 !forest_change/model/mask_mini3d.onnx
+!forest_change/model/masknet_v2_cfc.onnx
+!forest_change/model/typenet_cfc.onnx
+!forest_change/model/typenet_encoder.onnx
