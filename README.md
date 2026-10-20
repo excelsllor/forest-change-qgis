@@ -10,6 +10,9 @@
 Финальные модели (v0.16): `outputs`/модели — см. [forest-change-model v3.0](https://github.com/excelsllor/forest-change-model)
 (там же послойные описания `MODEL_MASK_ARCH.md`/`MODEL_TYPES_ARCH.md`, блок-схемы и код).
 
+Схемы: [маска](https://github.com/excelsllor/forest-change-model/blob/master/docs/10_mask_final_bicfcpn_big.png) ·
+[TypeNet](https://github.com/excelsllor/forest-change-model/blob/master/docs/11_typenet_final.png).
+
 ## Как работает
 
 1. **Маска (модель)**: для каждого чипа 32 px (320 м) строится ряд по датам —
