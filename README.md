@@ -36,7 +36,7 @@ macro-F1 0.870 на val, строго по маске). Геообработка
 Требуется QGIS 3.16+ (проверено на 3.44 LTR, Python 3.12).
 
 **Вариант A — из ZIP (рекомендуется):**
-1. скачайте `forest_change_plugin_v0.14.1.zip` из
+1. скачайте `forest_change_plugin_v0.15.0.zip` из
    [Releases плагина](https://github.com/excelsllor/forest-change-qgis/releases);
 2. QGIS → *Модули → Управление модулями → Установить из ZIP* → выберите файл;
 3. включите модуль «Forest Change Detection (DOFA+CfC)».
@@ -52,8 +52,8 @@ C:\Users\<user>\AppData\Local\Programs\OSGeo4W\apps\Python312\python.exe -m pip 
 # опционально GPU: -m pip install onnxruntime-directml
 ```
 
-**Модели (52 МБ) входят в ZIP:** `masknet_encoder.onnx` (5.7 МБ), `masknet_cfc.onnx` (4.9 МБ, контекст 3×3),
-`typenet_encoder.onnx` (30.4 МБ), `typenet_cfc.onnx` (10.9 МБ, динамическое T, CfC на CPU). Legacy-модель `forest_change_fusion128.onnx` (426 МБ, старая версия)
+**Модели (51.6 МБ) входят в ZIP:** `masknet_encoder.onnx` (5.5 МБ, λ-стем свёрнут), `masknet_cfc.onnx` (4.9 МБ, динамическое T),
+`typenet_encoder.onnx` (30.3 МБ), `typenet_cfc.onnx` (10.9 МБ, динамическое T, CfC на CPU). Legacy-модель `forest_change_fusion128.onnx` (426 МБ, старая версия)
 в ZIP не входит — при желании скачайте из Releases моделей. Чекпоинты для дообучения —
 в репозитории [forest-change-model](https://github.com/excelsllor/forest-change-model) (v2.0).
 
@@ -73,8 +73,8 @@ C:\Users\<user>\AppData\Local\Programs\OSGeo4W\apps\Python312\python.exe -m pip 
 
 (Режим **«Готовые периоды (мозаики)»** — для наших мозаик `<дата>_<band>.tif` с 4 каноническими датами.)
 
-**Ориентир (проверено на p3-мозаике, 2025-07→2026-06, 98 тайлов):** маска 14 087 чипов
-(144.3 тыс. га) за ~49 с; типы для 13 376 клеток — **177 с cold / 40 с warm** (кэш фич
+**Ориентир (проверено на p3-мозаике, 2025-07→2026-06, 98 тайлов):** маска 14 112 чипов
+(144.5 тыс. га) за 59 с; типы для 13 385 клеток — **177 с cold / 40 с warm** (кэш фич
 энкодера в `out_dir/cache`, энкодер DirectML, CfC на CPU); выход — `classes.tif`,
 `changes.gpkg`, `cells.gpkg`.
 
@@ -88,15 +88,15 @@ C:\Users\<user>\AppData\Local\Programs\OSGeo4W\apps\Python312\python.exe -m pip 
 
 ## Точность
 
-**Маска изменения (бинарно, MaskNet-v2 bicfcpn_big + сводки + контекст 3×3):**
+**Маска изменения (бинарно, bicfcpn_big + сводки + контекст 3×3 + length-aware CfC):**
 
 | метрика | значение |
 |---|---|
-| val F1 (vozh, полные ряды) | **0.936** (P 0.942 / R 0.931), p1/p2/p3 0.939/0.971/0.907 |
-| организаторы (held-out кварталы) | **0.936** (P 0.942 / R 0.931) |
-| GT p3 на сцене (через плагин) | P 0.963 / R 0.951 / F1 **0.957** |
+| val F1 (vozh, точные длины 2–4) | **0.929** (P 0.916 / R 0.942), p1/p2/p3 0.925/0.960/0.906 |
+| clean-val (окна без пересечения кварталов) | **0.940** |
+| GT p3 на сцене (через плагин) | P 0.966 / R 0.952 / F1 **0.959** |
 | zero-vol (без снимков) | 0.008 — решения полностью из изображений |
-| скорость (256 чипов) | GPU 339 мс, CPU 3.85 с; вся сцена p3 — 53 с |
+| скорость (p3, 98 тайлов) | **59 с** (энкодер DML + CfC CPU, динамическое T) |
 
 **Тип изменения (TypeNet, строго по маске; val, macro по присутствующим классам):**
 

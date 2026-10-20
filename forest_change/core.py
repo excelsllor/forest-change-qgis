@@ -375,36 +375,29 @@ def _series_read(mode, s, band_idx, label, c0, r0, w, h):
 
 
 class MaskCtxModel:
-    """Context mask CfC (ONNX): feats + 3x3 context + valid + dt + doy -> logits (fixed T=8)."""
+    """Context mask CfC with dynamic T and explicit lengths (ONNX Loop).
+
+    Runs on CPU: the ONNX Loop operator produces wrong results on DirectML.
+    """
 
     def __init__(self, path, provider="cpu"):
         import onnxruntime as ort
         with open(path, "rb") as fh:
             buf = fh.read()
-        try:
-            self.sess = ort.InferenceSession(buf, providers=pick_providers(provider))
-        except Exception:
-            self.sess = ort.InferenceSession(buf, providers=["CPUExecutionProvider"])
+        self.sess = ort.InferenceSession(buf, providers=["CPUExecutionProvider"])
 
     @property
     def provider(self):
         return self.sess.get_providers()[0]
 
-    def run(self, feats, ctx, valid, dt, doy):
-        """feats (M,T,256), ctx (M,T,3,3,256), valid (M,T,3,3) -> (M,2); pads to T=8."""
-        B, T = feats.shape[0], feats.shape[1]
-        if T < MASK_CTX_T:
-            pad = MASK_CTX_T - T
-            feats = np.concatenate([feats, np.zeros((B, pad, 256), np.float32)], 1)
-            ctx = np.concatenate([ctx, np.zeros((B, pad, 3, 3, 256), np.float32)], 1)
-            valid = np.concatenate([valid, np.zeros((B, pad, 3, 3), bool)], 1)
-            dt = np.concatenate([dt, np.zeros((B, pad), np.float32)], 1)
-            doy = np.concatenate([doy, np.zeros((B, pad, 3), np.float32)], 1)
+    def run(self, feats, ctx, valid, dt, doy, lengths):
+        """feats (M,T,256), ctx (M,T,3,3,256), valid (M,T,3,3), lengths (M,) -> (M,2)."""
         return self.sess.run(None, {"feats": feats.astype(np.float32),
                                     "ctx": ctx.astype(np.float32),
                                     "valid": valid.astype(np.float32),
                                     "dt": dt.astype(np.float32),
-                                    "doy": doy.astype(np.float32)})[0]
+                                    "doy": doy.astype(np.float32),
+                                    "lengths": lengths.astype(np.int64)})[0]
 
 
 class EncoderModel:
@@ -496,10 +489,11 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
     def flush():
         for feats, ctx, cval, dtb, doyb, pos in buf:
             n = len(feats)
+            ln = np.full(n, feats.shape[1], np.int64)      # all selected dates are valid
             for i0 in range(0, n, 256):
                 logits = model.run(feats[i0:i0 + 256], ctx[i0:i0 + 256],
                                    cval[i0:i0 + 256], dtb[i0:i0 + 256],
-                                   doyb[i0:i0 + 256])
+                                   doyb[i0:i0 + 256], ln[i0:i0 + 256])
                 for j in range(logits.shape[0]):
                     if int(np.argmax(logits[j])) == 1:
                         cells_changed.append(pos[i0 + j])
@@ -541,8 +535,8 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
             chips = np.ascontiguousarray(chips).reshape(nr * nc, 6, CHIP, CHIP)
             gvalid[li] = (chips.sum(axis=(1, 2, 3)) > 0).reshape(nr, nc)
             f = np.empty((nr * nc, 256), np.float32)
-            for i0 in range(0, nr * nc, 128):
-                f[i0:i0 + 128] = enc.run(chips[i0:i0 + 128])
+            for i0 in range(0, nr * nc, 512):
+                f[i0:i0 + 512] = enc.run(chips[i0:i0 + 512])
             grid[li] = f.reshape(nr, nc, 256)
         first_i = series[0][:, oy:oy + th, ox:ox + tw]
         last_i = series[-1][:, oy:oy + th, ox:ox + tw]
@@ -601,7 +595,7 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
     ds = None
     px_area = s["gt"][1] * abs(s["gt"][5]) / 1e4
     summary = {"mode": mode, "period": period, "model": os.path.basename(mask_model),
-               "provider": model.provider, "dates": labels, "n_dates_total": len(dt_all),
+               "provider": enc.provider, "cfc_provider": model.provider, "dates": labels, "n_dates_total": len(dt_all),
                "tile_px": TILE_PX, "tiles": len(tiles),
                "changed_chips": changed_chips, "changed_px": changed_chips * CHIP * CHIP,
                "invalid_px": invalid_px,
