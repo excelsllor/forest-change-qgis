@@ -51,6 +51,8 @@ PROVIDER_MAP = {
 }
 CHIP = 32          # 320 m at 10 m resolution (same scale as the training chips)
 SCALE = 10000.0
+BOA_OFFSET = 0.1        # L2A BOA_ADD_OFFSET = -1000 (baseline 04.00); training raw DN kept it
+_BOA_FIX = None         # None = not detected yet, True = add +0.1 (offset-corrected input)
 MASK_T = 8             # fixed sequence length of the exported type ONNX (zero padding)
 MASK_CTX_T = 4         # fixed sequence length of the context mask ONNX (as in its training)
 MASK_BATCH = 128       # chips per model call
@@ -99,6 +101,36 @@ def _features9(bands):
 def _softmax(x):
     e = np.exp(x - x.max(axis=1, keepdims=True))
     return e / e.sum(axis=1, keepdims=True)
+
+
+def _boa_fix_raw(a):
+    """Match the training radiometry (raw L2A DN, BOA_ADD_OFFSET=-1000 not applied).
+
+    The training mosaics were built from L2A jp2 directly, so DN/10000 still contains
+    the +0.1 offset. If the user's input already has the offset applied (physical
+    reflectance: very low / negative values), add +1000 DN back, once per run.
+    """
+    global _BOA_FIX
+    if _BOA_FIX is None:
+        x = a.astype(np.float32) / SCALE
+        p1s = []
+        if x.ndim == 3:
+            for i in (0, 2):                      # B02, B04: dark bands
+                if x.shape[0] > i:
+                    v = x[i][x[i] > 0]
+                    if v.size >= 2000:
+                        p1s.append(float(np.percentile(v, 1)))
+        if p1s:
+            _BOA_FIX = bool(min(p1s) < 0.08 or float(x.min()) < 0)
+            if _BOA_FIX:
+                print("[forest_change] радиометрия: вход без BOA offset -> +0.1 "
+                      "(как в обучающих мозаиках)", flush=True)
+            else:
+                print("[forest_change] радиометрия: сырой L2A DN (offset уже в "
+                      "значениях, как в обучении)", flush=True)
+    if _BOA_FIX:
+        return a + np.float32(SCALE * BOA_OFFSET)
+    return a
 
 
 # ---------------------------------------------------------------- IO helpers
@@ -160,7 +192,7 @@ def _read_stack(path, band_idx, c0, r0, w, h):
     for i, b in enumerate(band_idx):
         out[i] = ds.GetRasterBand(b).ReadAsArray(c0, r0, w, h)
     del ds
-    return out
+    return _boa_fix_raw(out)
 
 
 _VRT_CACHE = {}
@@ -190,7 +222,7 @@ def _read_mosaic6(mosaic_dir, date, c0, r0, w, h):
     arr = vrt.ReadAsArray(c0, r0, w, h)
     if arr is None:
         raise IOError(f"Не удалось прочитать окно {w}x{h} ({date}) в мозаике {mosaic_dir}")
-    return arr
+    return _boa_fix_raw(arr)
 
 
 def guess_band_idx(path):
@@ -453,6 +485,8 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
     """
     if not mask_model or not os.path.exists(mask_model):
         raise ValueError(f"Модель маски не найдена: {mask_model}")
+    global _BOA_FIX
+    _BOA_FIX = None
     os.makedirs(out_dir, exist_ok=True)
     s = _setup(mode, period, mosaic_dir, files, t1_path, t2_path, aoi_bbox)
     if mode != "period":
@@ -596,7 +630,7 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
     px_area = s["gt"][1] * abs(s["gt"][5]) / 1e4
     summary = {"mode": mode, "period": period, "model": os.path.basename(mask_model),
                "provider": enc.provider, "cfc_provider": model.provider, "dates": labels, "n_dates_total": len(dt_all),
-               "tile_px": TILE_PX, "tiles": len(tiles),
+               "boa_offset": bool(_BOA_FIX), "tile_px": TILE_PX, "tiles": len(tiles),
                "changed_chips": changed_chips, "changed_px": changed_chips * CHIP * CHIP,
                "invalid_px": invalid_px,
                "changed_ha": float(changed_chips * CHIP * CHIP * px_area), "mask_tif": path}
@@ -646,6 +680,8 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
             t2_path=None, band_idx=None, aoi_bbox=None, progress=None, mask_path=None,
             provider="auto"):
     """Type classification of the changed chips (tiles without changes are skipped)."""
+    global _BOA_FIX
+    _BOA_FIX = None
     os.makedirs(out_dir, exist_ok=True)
     s = _setup(mode, period, mosaic_dir, files, t1_path, t2_path, aoi_bbox)
     if mode != "period":
@@ -834,7 +870,7 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
         n_px[CLASSES[k]] = float(sum(1 for _, _, kk, _ in cells if kk == k) * CHIP * CHIP
                                  * gt[1] * abs(gt[5]) / 1e4)
     summary = {"mode": mode, "period": period, "provider": enc.provider,
-               "cfc_provider": cfc.provider,
+               "cfc_provider": cfc.provider, "boa_offset": bool(_BOA_FIX),
                "chip": CHIP, "tile_px": TILE_PX, "scale_m": gt[1], "change_thr": CHANGE_THR,
                "cells": len(cells),
                "used_mask": os.path.basename(mask_file) if use_mask else None,
