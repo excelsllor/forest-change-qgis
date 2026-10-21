@@ -100,6 +100,23 @@ def _features9(bands):
     return np.stack([b02, b03, b04, b08, b11, b12, ndvi, nbr, ndmi])
 
 
+def _texture9(chip):
+    """9 texture features of one 32x32 chip (B08 gradients) for the Vozh-tuned TypeNet."""
+    g = chip[3].astype(np.float32)
+    gy, gx = np.gradient(g)
+    mag = np.hypot(gx, gy)
+    ang = (np.arctan2(gy, gx) % np.pi) / np.pi
+    hist = np.zeros(4, np.float32)
+    for b in range(4):
+        hist[b] = mag[(ang >= b / 4) & (ang < (b + 1) / 4)].sum()
+    hist /= max(float(hist.sum()), 1e-6)
+    ent = float(-(hist * np.log(hist + 1e-6)).sum() / np.log(4))
+    aniso = float((hist.max() - hist.min()) / (hist.mean() + 1e-6))
+    edge = float((mag > mag.mean() + mag.std()).mean())
+    return np.array([*hist, ent, aniso, edge, float(g.std()), float(mag.mean())],
+                    np.float32)
+
+
 def _softmax(x):
     e = np.exp(x - x.max(axis=1, keepdims=True))
     return e / e.sum(axis=1, keepdims=True)
@@ -536,15 +553,19 @@ class TypeCfCModel:
         with open(path, "rb") as fh:
             buf = fh.read()
         self.sess = ort.InferenceSession(buf, providers=["CPUExecutionProvider"])
+        self.has_spec = any(i.name == "spec" for i in self.sess.get_inputs())
 
     @property
     def provider(self):
         return self.sess.get_providers()[0]
 
-    def run(self, feats, dt, doy):
-        return self.sess.run(None, {"feats": feats.astype(np.float32),
-                                    "dt": dt.astype(np.float32),
-                                    "doy": doy.astype(np.float32)})[0]
+    def run(self, feats, dt, doy, spec=None):
+        feed = {"feats": feats.astype(np.float32),
+                "dt": dt.astype(np.float32),
+                "doy": doy.astype(np.float32)}
+        if self.has_spec:
+            feed["spec"] = spec.astype(np.float32)
+        return self.sess.run(None, feed)[0]
 
 
 def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_path=None,
@@ -807,8 +828,9 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
         print(f"[forest_change] кэш фич типов: {len(fcache)} чипов "
               f"({os.path.basename(cache_path)})", flush=True)
     print(f"[forest_change] типы: TypeNet (энкодер {os.path.basename(enc_path)} + "
-          f"cross-attention readout {os.path.basename(model_path)}, динамическое T, readout на CPU), "
-          f"{len(labels)} дат", flush=True)
+          f"cross-attention readout {os.path.basename(model_path)}, динамическое T, "
+          f"readout на CPU{', texture 9' if cfc.has_spec else ''}), {len(labels)} дат",
+          flush=True)
     cells = []
     tiles = _tiles(w, h)
     if progress:
@@ -839,8 +861,15 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
         for i, k_ in enumerate(keys):
             if k_ not in miss and i not in miss:
                 feats[i] = fcache[k_]
+        specb = None
+        if cfc.has_spec:
+            specb = np.zeros((M, D, 9), np.float32)
+            for i in range(M):
+                for d in range(D):
+                    specb[i, d] = _texture9(np.clip(chips[i, d], 0.0, 1.5))
         for i0 in range(0, M, 256):
-            logits = cfc.run(feats[i0:i0 + 256], dtb[i0:i0 + 256], doyb[i0:i0 + 256])
+            logits = cfc.run(feats[i0:i0 + 256], dtb[i0:i0 + 256], doyb[i0:i0 + 256],
+                             None if specb is None else specb[i0:i0 + 256])
             probs = _softmax(np.asarray(logits, dtype=np.float32))
             for j in range(logits.shape[0]):
                 k = int(logits[j].argmax()) + 1       # 0/1/2 -> logging/windfall/fire

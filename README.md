@@ -4,10 +4,11 @@
 **Маску изменения** считает контекстная нейросеть (CNN-энкодер + **cross-attention 3×3** +
 двунаправленный CfC с динамическим T, val F1 0.929), **тип изменения**
 (вырубка / ветровал / пожар) — TypeNet (дистиллированный DOFA-энкодер 12×768 +
-**cross-attention readout** по датам, macro-F1 0.911). Геообработка — GDAL/OGR, инференс — onnxruntime
+**cross-attention readout** + 9 текстурных признаков; Vozh-тюнинг, windfall F1 **0.772**;
+мульти-датасетная версия — macro-F1 0.911). Геообработка — GDAL/OGR, инференс — onnxruntime
 (CPU или DirectML/CUDA с авто-откатом на CPU).
 
-Финальные модели (v0.17): см. [forest-change-model v4.0](https://github.com/excelsllor/forest-change-model)
+Финальные модели (v0.18): см. [forest-change-model v5.0](https://github.com/excelsllor/forest-change-model)
 (там же послойные описания `MODEL_MASK_ARCH.md`/`MODEL_TYPES_ARCH.md`, блок-схемы и код).
 
 Схемы: [маска](https://github.com/excelsllor/forest-change-model/blob/master/docs/10_mask_final_bicfcpn_big.png) ·
@@ -43,7 +44,7 @@
 
 Требуется QGIS 3.16+ (проверено на 3.44 LTR, Python 3.12).
 
-1. скачайте `forest_change_plugin_v0.17.3.zip` из
+1. скачайте `forest_change_plugin_v0.18.0.zip` из
    [Releases плагина](https://github.com/excelsllor/forest-change-qgis/releases);
 2. QGIS → *Модули → Управление модулями → Установить из ZIP* → выберите файл;
 3. включите модуль «Forest Change Detection (DOFA+CfC)».
@@ -54,9 +55,10 @@ C:\Users\<user>\AppData\Local\Programs\OSGeo4W\apps\Python312\python.exe -m pip 
 # опционально GPU: -m pip install onnxruntime-directml
 ```
 
-**Модели (48 МБ) входят в ZIP:** `masknet_encoder.onnx` (5.5 МБ), `masknet_cfc.onnx` (4.7 МБ),
-`typenet_encoder.onnx` (30.3 МБ), `typenet_cfc.onnx` (9.3 МБ). Чекпоинты и код —
-[forest-change-model v4.0](https://github.com/excelsllor/forest-change-model).
+**Модели (55 МБ) входят в ZIP:** `masknet_encoder.onnx` (5.5 МБ), `masknet_cfc.onnx` (4.7 МБ),
+`typenet_encoder.onnx` (30.3 МБ), `typenet_cfc_vozh_tex.onnx` (8.9 МБ, по умолчанию; Vozh-тюнинг),
+`typenet_cfc.onnx` (9.3 МБ, мульти-датасетная альтернатива). Чекпоинты и код —
+[forest-change-model v5.0](https://github.com/excelsllor/forest-change-model).
 
 ## Как проверить
 
@@ -93,32 +95,44 @@ C:\Users\<user>\AppData\Local\Programs\OSGeo4W\apps\Python312\python.exe -m pip 
 | zero-vol (без снимков) | F1 0.008 — решения из изображений |
 | масштабирование | Vozh-домен; zero-shot на DISFOR/California без контекста слабый |
 
-**Тип изменения (TypeNet; val, per-class F1):**
+**Тип изменения — Vozh-тюнинг (по умолчанию, `typenet_cfc_vozh_tex.onnx`; val, per-class F1):**
+
+| датасет | n | logging | windfall | fire | macro / acc |
+|---|---|---|---|---|---|
+| **vozh** | 886 | **0.962** | **0.772** | — (n=1) | acc **0.933** |
+
+**Vozh по всем классам** (val, n=886, accuracy 0.933):
+
+| класс | n | precision | recall | F1 |
+|---|---|---|---|---|
+| logging | 746 | 0.949 | 0.975 | 0.962 |
+| windfall | 139 | 0.833 | 0.719 | 0.772 |
+| fire | 1 | 0.000 | 0.000 | 0.000 |
+
+**Мульти-датасетная альтернатива** (`typenet_cfc.onnx`; val, per-class F1):
 
 | датасет | logging | windfall | fire | macro |
 |---|---|---|---|---|
-| все | **0.947** | **0.938** | **0.973** | **0.911** |
+| все | 0.947 | 0.938 | 0.973 | 0.911 |
 | vozh | 0.949 | 0.693 | — | 0.547 |
 | big4 (DISFOR) | 0.859 | 0.910 | 0.935 | 0.901 |
 | california | — | — | 0.987 | 0.987 |
 | pairs (DISFOR) | 0.964 | 0.945 | 1.000 | 0.970 |
 | long (DISFOR) | 0.900 | 0.857 | 1.000 | 0.919 |
 
-**Vozh по всем классам** (val, n=886, accuracy 0.912):
-
-| класс | n | precision | recall | F1 |
-|---|---|---|---|---|
-| logging | 746 | 0.934 | 0.965 | 0.949 |
-| windfall | 139 | 0.765 | 0.633 | 0.693 |
-| fire | 1 | 0.000 | 0.000 | 0.000 |
-
-GT-чипы p3 через пайплайн плагина: accuracy 0.799; logging F1 0.875 (recall 0.791),
-windfall F1 0.824 (recall 0.821), fire F1 0.750 (n=4).
+GT-чипы p3 через пайплайн плагина: accuracy 0.823; logging F1 0.895 (recall 0.821),
+windfall F1 0.865 (recall 0.830), fire F1 0.857 (n=4); p3 val-подмножество: windfall F1 0.595.
+Ветровал остаётся самым трудным классом: 52 из 139 val-чипов модель уверенно относит к logging
+(см. `windfall_montage.png`: это сильные ветровалы/санитарные рубки, визуально близкие к вырубке).
+Текстура (+0.079), spectral indices (−0.03), spatial context (−0.04) и порог (+0.01) проверены;
+для F1 > 0.9 нужен новый сигнал: Sentinel-1 (VV/VH), даты сразу после шторма до санитарной рубки
+или более чистые метки причины.
 
 ## Ограничения
 
 - Маска обучена на Vozh (целевой домен плагина); для других регионов нужен дообучение.
-- Vozh windfall у TypeNet слабый (0.693) — редкий класс (139 val / 291 train).
+- Vozh windfall у TypeNet — самый слабый класс (0.772; 139 val / 291 train): 52 уверенно
+  относятся к logging (сильные ветровалы/санитарные рубки, визуально близкие к вырубке).
 - На ложных срабатываниях маски TypeNet отвечает «windfall» (`no_change` не обучен) — доля классов
   на карте зависит от порога маски.
 

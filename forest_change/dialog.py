@@ -19,7 +19,7 @@ except AttributeError:  # Qt5
 from . import periods
 
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model")
-DEFAULT_MODEL = os.path.join(MODEL_DIR, "typenet_cfc.onnx")
+DEFAULT_MODEL = os.path.join(MODEL_DIR, "typenet_cfc_vozh_tex.onnx")
 DEFAULT_MASK_MODEL = os.path.join(MODEL_DIR, "masknet_cfc.onnx")
 BANDS6 = ("B02", "B03", "B04", "B08", "B11", "B12")
 SETTINGS = "forest_change"
