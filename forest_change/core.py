@@ -54,6 +54,7 @@ SCALE = 10000.0
 BOA_OFFSET = 0.1        # L2A BOA_ADD_OFFSET = -1000 (baseline 04.00); training raw DN kept it
 _BOA_ENV = os.environ.get("FC_BOA", "auto").strip().lower()   # auto | raw | corrected
 _BOA_MODE = {}          # source key -> True (add +0.1) / False (raw DN)
+_BOA_AMBIG = {}         # source key -> p0.5 in the grey zone (convention unclear)
 MASK_T = 8             # fixed sequence length of the exported type ONNX (zero padding)
 MASK_CTX_T = 4         # fixed sequence length of the context mask ONNX (as in its training)
 MASK_BATCH = 128       # chips per model call
@@ -105,24 +106,32 @@ def _softmax(x):
 
 
 def _boa_decide(arr):
-    """Decide the radiometry convention from a coarse sample of the WHOLE source.
+    """Decide the radiometry convention from full-resolution samples of the source.
 
-    arr: (bands, h, w) raw values. Raw L2A DN (offset not applied) has p0.5 ~0.1
+    arr: (bands, N) raw values. Raw L2A DN (offset not applied) has p0.5 ~0.1
     (the +1000 offset); offset-corrected physical reflectance is near 0/negative.
-    Returns True (add +0.1), False (raw), or None (too few pixels).
+    The 0.06-0.09 band is ambiguous (bright corrected scenes / dark raw ones):
+    we do NOT shift and flag it for the caller (FC_BOA overrides).
+    Returns (fix, lo, ambiguous) or (None, lo, False) when too few pixels.
     """
     x = arr.astype(np.float32) / SCALE
-    if x.ndim == 2:
-        x = x[None]
     pos = x[x > 0]
     if pos.size < 1000:
-        return None
+        return None, 0.0, False
     lo = float(np.percentile(pos, 0.5))
-    return bool(lo < 0.06 or float(x.min()) < 0)
+    if lo < 0.06 or float(x.min()) < 0:
+        return True, lo, False
+    if lo <= 0.09:
+        return False, lo, True
+    return False, lo, False
 
 
-def _boa_sample(src, key):
-    """Detect + cache the BOA convention for one source (mosaic date / file)."""
+def _boa_sample(src, key, bands):
+    """Detect + cache the BOA convention for one source (mosaic date / file).
+
+    Uses 4x4 blocks spread over the whole raster at FULL resolution (no resampling,
+    so percentiles are honest; overviews/averaging would smooth the extremes).
+    """
     if key in _BOA_MODE:
         return
     if _BOA_ENV in ("raw", "none", "off"):
@@ -135,21 +144,32 @@ def _boa_sample(src, key):
         return
     try:
         w, h = src.RasterXSize, src.RasterYSize
-        bw, bh = min(256, w), min(256, h)
-        arr = src.ReadAsArray(0, 0, w, h, buf_xsize=bw, buf_ysize=bh)
+        blocks = []
+        for by in range(4):
+            for bx in range(4):
+                x0 = int(bx * w / 4)
+                y0 = int(by * h / 4)
+                bw, bh = min(128, w - x0), min(128, h - y0)
+                arrs = [src.GetRasterBand(int(b)).ReadAsArray(x0, y0, bw, bh)
+                        for b in bands]
+                blocks.append(np.stack(arrs).reshape(len(bands), -1))
+        arr = np.concatenate(blocks, axis=1)
     except Exception:
         return
-    if arr is None:
-        return
-    fix = _boa_decide(arr)
+    fix, lo, amb = _boa_decide(arr)
     if fix is None:
         return
     _BOA_MODE[key] = fix
     if fix:
-        print(f"[forest_change] радиометрия {key}: вход без BOA offset -> +0.1", flush=True)
+        print(f"[forest_change] радиометрия {key}: вход без BOA offset -> +0.1 "
+              f"(p0.5={lo:.3f})", flush=True)
     else:
-        print(f"[forest_change] радиометрия {key}: сырой L2A DN (offset в значениях)",
-              flush=True)
+        print(f"[forest_change] радиометрия {key}: сырой L2A DN "
+              f"(p0.5={lo:.3f})", flush=True)
+    if amb:
+        _BOA_AMBIG[key] = lo
+        print(f"[forest_change] ВНИМАНИЕ {key}: p0.5={lo:.3f} в серой зоне 0.06-0.09 — "
+              f"конвенция BOA неоднозначна; задайте FC_BOA=raw|corrected", flush=True)
 
 
 def _boa_fix_raw(a, key):
@@ -240,7 +260,7 @@ def _read_stack(path, band_idx, c0, r0, w, h):
     for i, b in enumerate(band_idx):
         out[i] = ds.GetRasterBand(b).ReadAsArray(c0, r0, w, h)
     key = os.path.abspath(path)
-    _boa_sample(ds, key)
+    _boa_sample(ds, key, band_idx)
     del ds
     return _boa_fix_raw(out, key)
 
@@ -273,7 +293,7 @@ def _read_mosaic6(mosaic_dir, date, c0, r0, w, h):
     if arr is None:
         raise IOError(f"Не удалось прочитать окно {w}x{h} ({date}) в мозаике {mosaic_dir}")
     key = f"{os.path.basename(mosaic_dir)}/{date}"
-    _boa_sample(vrt, key)
+    _boa_sample(vrt, key, list(range(1, vrt.RasterCount + 1)))
     return _boa_fix_raw(arr, key)
 
 
@@ -538,6 +558,7 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
     if not mask_model or not os.path.exists(mask_model):
         raise ValueError(f"Модель маски не найдена: {mask_model}")
     _BOA_MODE.clear()
+    _BOA_AMBIG.clear()
     os.makedirs(out_dir, exist_ok=True)
     s = _setup(mode, period, mosaic_dir, files, t1_path, t2_path, aoi_bbox)
     if mode != "period":
@@ -683,6 +704,7 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
     summary = {"mode": mode, "period": period, "model": os.path.basename(mask_model),
                "provider": enc.provider, "cfc_provider": model.provider, "dates": labels, "n_dates_total": len(dt_all),
                "boa_offset": sorted(str(k) for k, v in _BOA_MODE.items() if v),
+               "boa_ambiguous": sorted(f"{k} p0.5={v:.3f}" for k, v in _BOA_AMBIG.items()),
                "boa_checked": len(_BOA_MODE), "boa_mode": _BOA_ENV,
                "series_warning": warn, "tile_px": TILE_PX, "tiles": len(tiles),
                "changed_chips": changed_chips, "changed_px": changed_chips * CHIP * CHIP,
@@ -735,6 +757,7 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
             provider="auto"):
     """Type classification of the changed chips (tiles without changes are skipped)."""
     _BOA_MODE.clear()
+    _BOA_AMBIG.clear()
     os.makedirs(out_dir, exist_ok=True)
     s = _setup(mode, period, mosaic_dir, files, t1_path, t2_path, aoi_bbox)
     if mode != "period":
@@ -926,6 +949,7 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
     summary = {"mode": mode, "period": period, "provider": enc.provider,
                "cfc_provider": cfc.provider,
                "boa_offset": sorted(str(k) for k, v in _BOA_MODE.items() if v),
+               "boa_ambiguous": sorted(f"{k} p0.5={v:.3f}" for k, v in _BOA_AMBIG.items()),
                "boa_checked": len(_BOA_MODE), "boa_mode": _BOA_ENV,
                "series_warning": warn,
                "chip": CHIP, "tile_px": TILE_PX, "scale_m": gt[1], "change_thr": CHANGE_THR,
