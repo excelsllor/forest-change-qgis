@@ -477,8 +477,8 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
         raise ValueError(f"Энкодер маски не найден рядом с моделью: {enc_path}")
     enc = EncoderModel(enc_path, provider)
     model = MaskCtxModel(mask_model, provider)
-    print(f"[forest_change] маска: энкодер {os.path.basename(enc_path)} + CfC "
-          f"{os.path.basename(mask_model)} (контекст 3x3)", flush=True)
+    print(f"[forest_change] маска: энкодер {os.path.basename(enc_path)} + attention-контекст 3x3 "
+          f"+ CfC {os.path.basename(mask_model)}", flush=True)
     changed_chips = 0
     invalid_px = 0
     if progress:
@@ -693,9 +693,9 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
         fcache = {(int(a), int(b)): _zf[i] for i, (a, b) in enumerate(_zk)}
         print(f"[forest_change] кэш фич типов: {len(fcache)} чипов "
               f"({os.path.basename(cache_path)})", flush=True)
-    print(f"[forest_change] типы: TypeNet (энкодер {os.path.basename(enc_path)} + CfC "
-          f"{os.path.basename(model_path)}, динамическое T, CfC на CPU), {len(labels)} дат",
-          flush=True)
+    print(f"[forest_change] типы: TypeNet (энкодер {os.path.basename(enc_path)} + "
+          f"cross-attention readout {os.path.basename(model_path)}, динамическое T, readout на CPU), "
+          f"{len(labels)} дат", flush=True)
     cells = []
     tiles = _tiles(w, h)
     if progress:

@@ -2,11 +2,11 @@
 name=Forest Change Detection (DOFA+CfC)
 qgisMinimumVersion=3.16
 qgisMaximumVersion=4.99
-description=Forest change detection: the binary change mask is produced by a neural model (CNN + bidirectional length-aware CfC with 3x3 context and mean/last-first temporal summaries, organizers F1 0.931), the change type (logging / windfall / fire) is classified by a distilled DOFA-style CNN encoder + CfC network on 320 m cells.
-version=0.16.0
+description=Forest change detection: the binary change mask is produced by a neural model (CNN + cross-attention 3x3 neighbourhood + bidirectional length-aware CfC with mean/last-first temporal summaries, organizers F1 0.929), the change type (logging / windfall / fire) is classified by a distilled DOFA-style CNN encoder + cross-attention readout on 320 m cells (macro-F1 0.911).
+version=0.17.0
 author=Forest Hackathon Team
 email=team@example.com
-about=Detects forest cover changes between two dates (or a whole time series): the change mask is computed by a neural model - a compact CNN over the multi-date volume fused with a bidirectional CfC recurrent branch (length-aware pooling, dynamic T 2-8 dates), temporal feature summaries and a 3x3 neighbourhood context (organizers F1 0.931, P 0.938 / recall 0.924) - and a TypeNet (distilled DOFA-style 12x768 encoder + CfC with mean/last-first temporal summaries, val macro-F1 0.870 on changed chips) classifies the type of the changed 32 px (320 m) chips (logging/windfall/fire). Urban/water/bare pixels are excluded via Sentinel-2 SCL and an NDVI vegetation check. Outputs: class raster, merged change polygons and a cells layer (one polygon per changed cell with coordinates, type and confidence). Runs on CPU (onnxruntime).
+about=Detects forest cover changes between two dates (or a whole time series): the change mask is computed by a neural model - a compact CNN over the multi-date volume with a cross-attention 3x3 neighbourhood (centre queries its 9 neighbours, 8 heads, validity mask) and a bidirectional CfC recurrent branch (length-aware pooling, dynamic T 2-8 dates), temporal feature summaries (organizers F1 0.929, P 0.951 / recall 0.907) - and a TypeNet (distilled DOFA-style 12x768 encoder + cross-attention readout over the dates, val macro-F1 0.911 on changed chips; vozh logging F1 0.949, windfall 0.693) classifies the type of the changed 32 px (320 m) chips (logging/windfall/fire). Urban/water/bare pixels are excluded via Sentinel-2 SCL and an NDVI vegetation check. Outputs: class raster, merged change polygons and a cells layer (one polygon per changed cell with coordinates, type and confidence). Runs on CPU (onnxruntime).
 tracker=https://github.com/excelsllor/forest-change-qgis/issues
 repository=https://github.com/excelsllor/forest-change-qgis
 tags=forest,change detection,dofa,vit,remote sensing
