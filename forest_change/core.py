@@ -24,11 +24,16 @@ Outputs in out_dir: mask.tif, classes.tif, changes.gpkg, cells.gpkg, summary.jso
 import hashlib
 import json
 import os
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from osgeo import gdal, ogr, osr
+
+_VENDOR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
+if os.path.isdir(os.path.join(_VENDOR, "onnxruntime")) and _VENDOR not in sys.path:
+    sys.path.insert(0, _VENDOR)
 
 gdal.UseExceptions()
 gdal.SetConfigOption("GDAL_CACHEMAX", "512")   # keep decompressed 512x512 blocks hot
@@ -435,9 +440,14 @@ def _parse_date(text):
     return (y, mo) if 1 <= mo <= 12 else None
 
 
-def _select_dates(n, cap=None):
-    """At most `cap` dates (default MASK_T), first and last always kept (evenly spaced)."""
+def _select_dates(n, cap=None, keep_intermediate=True):
+    """At most `cap` dates (default MASK_T), first and last always kept (evenly spaced).
+
+    keep_intermediate=False -> only the first and last dates (fast mode).
+    """
     cap = MASK_T if cap is None else cap
+    if not keep_intermediate:
+        return [0, n - 1] if n >= 2 else [0]
     if n <= cap:
         return list(range(n))
     idx = np.linspace(0, n - 1, cap).round().astype(int)
@@ -570,7 +580,8 @@ class TypeCfCModel:
 
 def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_path=None,
                  t2_path=None, band_idx=None, aoi_bbox=None, progress=None, thr=None,
-                 provider="auto", mask_model=None, dates=None):
+                 provider="auto", mask_model=None, dates=None, use_intermediate=True,
+                 force_mask=False):
     """Model-based change mask -> mask.tif (1 changed chip / 0 / 255).
 
     MaskNet-v2 (bicfcpn_big ONNX) processes the raw-reflectance time series of every
@@ -586,7 +597,7 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
         s["series_files"] = list(files or []) or ([t1_path, t2_path] if t1_path else [])
     labels, dt_all, kind, paths = _series_for(s, mode, dates)
     warn = _series_warning(labels, dt_all, mode)
-    sel = _select_dates(len(labels), cap=MASK_CTX_T)
+    sel = _select_dates(len(labels), cap=MASK_CTX_T, keep_intermediate=use_intermediate)
     labels = [labels[i] for i in sel]
     dt_sel = np.zeros(len(sel), np.float32)
     for k in range(1, len(sel)):
@@ -596,13 +607,48 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
     print(f"[forest_change] маска: {len(sel)} дат из {len(dt_all)} (первая/последняя сохранены), "
           f"модель {os.path.basename(mask_model)}", flush=True)
 
-    path = os.path.join(out_dir, "mask.tif")
-    ds = _create_raster(path, s["gt"], s["c0"], s["r0"], s["w"], s["h"], s["proj"])
-    band = ds.GetRasterBand(1)
-    tiles = _tiles(s["w"], s["h"])
     enc_path = os.path.join(os.path.dirname(mask_model), "masknet_encoder.onnx")
     if not os.path.exists(enc_path):
         raise ValueError(f"Энкодер маски не найден рядом с моделью: {enc_path}")
+    src_sig = []
+    if mode == "period":
+        for l in labels:
+            for f in (f"{l}_B04.tif", f"{l}_SCL.tif"):
+                p = os.path.join(mosaic_dir, f)
+                if os.path.exists(p):
+                    src_sig.append((f, os.path.getmtime(p)))
+    else:
+        for pth in (s.get("series_files") or []):
+            if pth and os.path.exists(pth):
+                src_sig.append((os.path.basename(pth), os.path.getmtime(pth)))
+    cache_key = hashlib.md5(json.dumps({
+        "v": 2, "mode": mode, "period": period, "labels": labels,
+        "dt": [round(float(x), 4) for x in dt_sel],
+        "inter": bool(use_intermediate),
+        "thr": float(thr if thr is not None else CHANGE_THR),
+        "model": os.path.getmtime(mask_model), "enc": os.path.getmtime(enc_path),
+        "src": src_sig, "aoi": [s["c0"], s["r0"], s["w"], s["h"]],
+        "band_idx": list(band_idx) if band_idx else None,
+    }, sort_keys=True).encode()).hexdigest()
+
+    path = os.path.join(out_dir, "mask.tif")
+    cache_file = os.path.join(out_dir, "mask_cache.json")
+    if not force_mask and os.path.exists(path):
+        try:
+            with open(cache_file, encoding="utf-8") as fh:
+                cached = json.load(fh)
+            if cached.get("key") == cache_key:
+                summary = cached["summary"]
+                summary["cached"] = True
+                print(f"[forest_change] маска: кэш ({summary.get('changed_ha', 0):.1f} га) — "
+                      f"пропускаю расчёт", flush=True)
+                return summary
+        except Exception:
+            pass
+
+    ds = _create_raster(path, s["gt"], s["c0"], s["r0"], s["w"], s["h"], s["proj"])
+    band = ds.GetRasterBand(1)
+    tiles = _tiles(s["w"], s["h"])
     enc = EncoderModel(enc_path, provider)
     model = MaskCtxModel(mask_model, provider)
     print(f"[forest_change] маска: энкодер {os.path.basename(enc_path)} + attention-контекст 3x3 "
@@ -618,10 +664,10 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
         for feats, ctx, cval, dtb, doyb, pos in buf:
             n = len(feats)
             ln = np.full(n, feats.shape[1], np.int64)      # all selected dates are valid
-            for i0 in range(0, n, 256):
-                logits = model.run(feats[i0:i0 + 256], ctx[i0:i0 + 256],
-                                   cval[i0:i0 + 256], dtb[i0:i0 + 256],
-                                   doyb[i0:i0 + 256], ln[i0:i0 + 256])
+            for i0 in range(0, n, 512):
+                logits = model.run(feats[i0:i0 + 512], ctx[i0:i0 + 512],
+                                   cval[i0:i0 + 512], dtb[i0:i0 + 512],
+                                   doyb[i0:i0 + 512], ln[i0:i0 + 512])
                 for j in range(logits.shape[0]):
                     if int(np.argmax(logits[j])) == 1:
                         cells_changed.append(pos[i0 + j])
@@ -727,12 +773,16 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
                "boa_offset": sorted(str(k) for k, v in _BOA_MODE.items() if v),
                "boa_ambiguous": sorted(f"{k} p0.5={v:.3f}" for k, v in _BOA_AMBIG.items()),
                "boa_checked": len(_BOA_MODE), "boa_mode": _BOA_ENV,
-               "series_warning": warn, "tile_px": TILE_PX, "tiles": len(tiles),
+               "series_warning": warn, "intermediate_mask": bool(use_intermediate),
+               "cached": False, "thr": float(thr if thr is not None else CHANGE_THR),
+               "tile_px": TILE_PX, "tiles": len(tiles),
                "changed_chips": changed_chips, "changed_px": changed_chips * CHIP * CHIP,
                "invalid_px": invalid_px,
                "changed_ha": float(changed_chips * CHIP * CHIP * px_area), "mask_tif": path}
     with open(os.path.join(out_dir, "mask_summary.json"), "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2, ensure_ascii=False)
+    with open(cache_file, "w", encoding="utf-8") as fh:
+        json.dump({"key": cache_key, "summary": summary}, fh, ensure_ascii=False)
     return summary
 
 
@@ -775,7 +825,7 @@ def _mask_windows(change, chip=CHIP, block=BLOCK):
 
 def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None, t1_path=None,
             t2_path=None, band_idx=None, aoi_bbox=None, progress=None, mask_path=None,
-            provider="auto"):
+            provider="auto", use_intermediate=True):
     """Type classification of the changed chips (tiles without changes are skipped)."""
     _BOA_MODE.clear()
     _BOA_AMBIG.clear()
@@ -802,7 +852,7 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
         raise ValueError(f"Энкодер типов не найден рядом с моделью: {enc_path}")
     labels, dt_all, kind, paths = _series_for(s, mode, None)
     warn = _series_warning(labels, dt_all, mode)
-    sel = _select_dates(len(labels))
+    sel = _select_dates(len(labels), keep_intermediate=use_intermediate)
     labels = [labels[i] for i in sel]
     dt_sel = np.zeros(len(sel), np.float32)
     for k in range(1, len(sel)):
@@ -852,8 +902,8 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
         if miss:
             flat = chips[miss].reshape(len(miss) * D, 6, CHIP, CHIP)
             mf = np.empty((len(miss) * D, 768), np.float32)
-            for i0 in range(0, len(miss) * D, 256):
-                mf[i0:i0 + 256] = enc.run(flat[i0:i0 + 256])
+            for i0 in range(0, len(miss) * D, 512):
+                mf[i0:i0 + 512] = enc.run(flat[i0:i0 + 512])
             mf = mf.reshape(len(miss), D, 768)
             for j, mi in enumerate(miss):
                 feats[mi] = mf[j]
@@ -867,9 +917,9 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
             for i in range(M):
                 for d in range(D):
                     specb[i, d] = _texture9(np.clip(chips[i, d], 0.0, 1.5))
-        for i0 in range(0, M, 256):
-            logits = cfc.run(feats[i0:i0 + 256], dtb[i0:i0 + 256], doyb[i0:i0 + 256],
-                             None if specb is None else specb[i0:i0 + 256])
+        for i0 in range(0, M, 512):
+            logits = cfc.run(feats[i0:i0 + 512], dtb[i0:i0 + 512], doyb[i0:i0 + 512],
+                             None if specb is None else specb[i0:i0 + 512])
             probs = _softmax(np.asarray(logits, dtype=np.float32))
             for j in range(logits.shape[0]):
                 k = int(logits[j].argmax()) + 1       # 0/1/2 -> logging/windfall/fire
@@ -980,7 +1030,7 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
                "boa_offset": sorted(str(k) for k, v in _BOA_MODE.items() if v),
                "boa_ambiguous": sorted(f"{k} p0.5={v:.3f}" for k, v in _BOA_AMBIG.items()),
                "boa_checked": len(_BOA_MODE), "boa_mode": _BOA_ENV,
-               "series_warning": warn,
+               "series_warning": warn, "intermediate_types": bool(use_intermediate),
                "chip": CHIP, "tile_px": TILE_PX, "scale_m": gt[1], "change_thr": CHANGE_THR,
                "cells": len(cells),
                "used_mask": os.path.basename(mask_file) if use_mask else None,

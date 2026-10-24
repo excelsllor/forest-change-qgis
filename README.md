@@ -8,7 +8,7 @@
 мульти-датасетная версия — macro-F1 0.911). Геообработка — GDAL/OGR, инференс — onnxruntime
 (CPU или DirectML/CUDA с авто-откатом на CPU).
 
-Финальные модели (v0.18): см. [forest-change-model v5.0](https://github.com/excelsllor/forest-change-model)
+Финальные модели (v0.19): см. [forest-change-model v5.0](https://github.com/excelsllor/forest-change-model)
 (там же послойные описания `MODEL_MASK_ARCH.md`/`MODEL_TYPES_ARCH.md`, блок-схемы и код).
 
 Схемы: [маска](https://github.com/excelsllor/forest-change-model/blob/master/docs/10_mask_final_bicfcpn_big.png) ·
@@ -44,20 +44,15 @@
 
 Требуется QGIS 3.16+ (проверено на 3.44 LTR, Python 3.12).
 
-1. скачайте `forest_change_plugin_v0.18.0.zip` из
+1. скачайте `forest_change_plugin_v0.19.0.zip` из
    [Releases плагина](https://github.com/excelsllor/forest-change-qgis/releases);
 2. QGIS → *Модули → Управление модулями → Установить из ZIP* → выберите файл;
 3. включите модуль «Forest Change Detection (DOFA+CfC)».
 
-**Зависимости (один раз):**
-```powershell
-C:\Users\<user>\AppData\Local\Programs\OSGeo4W\apps\Python312\python.exe -m pip install onnxruntime
-# опционально GPU: -m pip install onnxruntime-directml
-```
-
-**Модели (55 МБ) входят в ZIP:** `masknet_encoder.onnx` (5.5 МБ), `masknet_cfc.onnx` (4.7 МБ),
-`typenet_encoder.onnx` (30.3 МБ), `typenet_cfc_vozh_tex.onnx` (8.9 МБ, по умолчанию; Vozh-тюнинг),
-`typenet_cfc.onnx` (9.3 МБ, мульти-датасетная альтернатива). Чекпоинты и код —
+**Все зависимости и модели — в ZIP (без pip):** onnxruntime 1.24.4 DirectML+CPU встроен в
+`vendor/` (63 МБ), модели — `masknet_encoder.onnx` (5.5 МБ), `masknet_cfc.onnx` (4.7 МБ),
+`typenet_encoder.onnx` (30.3 МБ), `typenet_cfc_vozh_tex.onnx` (9.3 МБ). Выбора моделей в UI нет:
+плагин всегда использует эти финальные версии. Чекпоинты и код —
 [forest-change-model v5.0](https://github.com/excelsllor/forest-change-model).
 
 ## Как проверить
@@ -65,23 +60,27 @@ C:\Users\<user>\AppData\Local\Programs\OSGeo4W\apps\Python312\python.exe -m pip 
 1. Откройте QGIS, загрузите снимки → включите модуль → панель **Forest Change**.
 2. Режим **«Загруженные снимки (слоты)»**: выберите слои проекта (даты), при необходимости добавьте слоты.
    - Каналы подставляются автоматически (S2 L2A → 2,3,4,8,11,12; 6-канальный стек → 1..6).
-3. **Провайдер**: Авто / CPU / CUDA / DirectML (ошибки — авто-откат на CPU).
+3. **Провайдер**: Авто / CPU / DirectML (ошибки — авто-откат на CPU).
 4. Укажите папку вывода и файлы моделей → **«1. Посчитать маску (модель)»**, затем
    **«2. Посчитать изменение по маске (модель)»** (или всё сразу).
 5. Маска рисуется красным на прозрачном; классы по типам (logging красный, windfall золотой,
    fire маджента); **Identify** по клетке — координаты, тип, уверенность.
 6. Файлы: `mask.tif`, `classes.tif`, `changes.gpkg`, `cells.gpkg`, `summary.json`.
 
-**Ориентир (p3-мозаика, 2025-07→2026-06):** маска — 42–65 с; типы — ~140 с cold
-(кэш фич в `out_dir/cache`).
+**Ориентир (p3-мозаика, 2025-07→2026-06):** маска — 46 с (повторно **0 с** из кэша);
+типы — 36 с warm / ~140 с cold (кэш фич в `out_dir/cache`). С выключенными промежуточными датами
+(T=2) — примерно вдвое быстрее по датам.
 
-## Скорость
+## Скорость и кэши
 
-- Маска: ~0.5 с/тайл 1024×1024; энкодер 0.036 мс/чип (DirectML, батч 512);
-  CtxAttn + CfC на CPU (динамическое T).
-- Типы: энкодер ~2.4 мс/чип-дата (DirectML); cross-attention readout на CPU; повторные прогоны
-  используют дисковый кэш фич (ключ = даты + энкодер + mtime данных).
-- I/O: in-memory VRT 6-в-1 для мозаик, кэш GDAL-хендлов, async-prefetch.
+- **Маска**: in-memory VRT 6-в-1, кэш GDAL-хендлов, async-prefetch; `mask_cache.json` —
+  повторный запуск с теми же датами/моделью/AOI мгновенный (0 с), пересчёт — 46 с.
+- **Типы**: дисковый кэш фич энкодера (ключ = даты + энкодер + mtime данных); батчи 512;
+  повторный прогон 36 с.
+- **Промежуточные даты**: чекбоксы для маски и для типов; выключение → T=2 (первая/последняя),
+  меньше чтений и вычислений.
+- **Модели/зависимости**: фиксированные последние модели + встроенный onnxruntime (DML/CPU),
+  без pip и без выбора файлов.
 
 ## Точность
 
@@ -169,5 +168,6 @@ forest_change/
   periods.py      даты канонических периодов набора
   metadata.txt    метаданные модуля
   icon.png
-  model/          masknet_encoder/masknet_cfc/typenet_encoder/typenet_cfc (.onnx)
+  model/          masknet_encoder/masknet_cfc/typenet_encoder/typenet_cfc_vozh_tex (.onnx)
+  vendor/         onnxruntime 1.24.4 (DirectML + CPU), встроен
 ```

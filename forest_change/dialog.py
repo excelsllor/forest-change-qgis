@@ -24,7 +24,7 @@ DEFAULT_MASK_MODEL = os.path.join(MODEL_DIR, "masknet_cfc.onnx")
 BANDS6 = ("B02", "B03", "B04", "B08", "B11", "B12")
 SETTINGS = "forest_change"
 DATE_RE = re.compile(r"(20\d{2})[-_./]?(\d{2})(?:[-_./]?(\d{2}))?")
-PROVIDERS = [("Авто", "auto"), ("CPU", "cpu"), ("CUDA", "cuda"), ("DirectML", "dml")]
+PROVIDERS = [("Авто", "auto"), ("CPU", "cpu"), ("DirectML", "dml")]
 
 
 def parse_date(text):
@@ -121,16 +121,21 @@ class ForestChangeDialog(QDialog):
 
         self.out = self._path_row(dir_mode=True)
         form.addRow("Папка вывода (маски)", self.out[0])
-        self.model = self._path_row(file_filter="ONNX (*.onnx)")
-        self.model[1].setText(DEFAULT_MODEL)
-        form.addRow("ONNX-модель (тип)", self.model[0])
-        self.mask_model = self._path_row(file_filter="ONNX (*.onnx)")
-        self.mask_model[1].setText(DEFAULT_MASK_MODEL)
-        form.addRow("ONNX-модель маски (3D-CNN+CfC)", self.mask_model[0])
 
         self.auto_apply = QCheckBox("Сразу накладывать маски на карту и приближать к ним")
         self.auto_apply.setChecked(True)
         root.addWidget(self.auto_apply)
+        self.mask_intermediate = QCheckBox(
+            "Учитывать промежуточные даты при расчёте маски (быстрее — выключить)")
+        self.mask_intermediate.setChecked(True)
+        root.addWidget(self.mask_intermediate)
+        self.types_intermediate = QCheckBox(
+            "Учитывать промежуточные даты при классификации изменений (быстрее — выключить)")
+        self.types_intermediate.setChecked(True)
+        root.addWidget(self.types_intermediate)
+        self.reuse_mask = QCheckBox("Использовать готовую маску, если она уже посчитана")
+        self.reuse_mask.setChecked(True)
+        root.addWidget(self.reuse_mask)
 
         root.addLayout(form)
         self.status = QLabel("Готово")
@@ -303,13 +308,13 @@ class ForestChangeDialog(QDialog):
             except Exception:
                 pass
         self.out[1].setText(s.value(f"{SETTINGS}/out", ""))
-        model = s.value(f"{SETTINGS}/model", "")
-        if model:
-            self.model[1].setText(model)
-        mm = s.value(f"{SETTINGS}/mask_model", "")
-        if mm:
-            self.mask_model[1].setText(mm)
         self.auto_apply.setChecked(str(s.value(f"{SETTINGS}/auto_apply", "true")).lower() == "true")
+        self.mask_intermediate.setChecked(
+            str(s.value(f"{SETTINGS}/mask_intermediate", "true")).lower() == "true")
+        self.types_intermediate.setChecked(
+            str(s.value(f"{SETTINGS}/types_intermediate", "true")).lower() == "true")
+        self.reuse_mask.setChecked(
+            str(s.value(f"{SETTINGS}/reuse_mask", "true")).lower() == "true")
         saved_slots = [x for x in str(s.value(f"{SETTINGS}/slots", "")).split("|") if x]
         while len(self.slots) < max(2, len(saved_slots)):
             self._add_slot()
@@ -327,9 +332,13 @@ class ForestChangeDialog(QDialog):
         s.setValue(f"{SETTINGS}/period", self.period.currentText())
         s.setValue(f"{SETTINGS}/bands", ",".join(str(sp.value()) for sp in self.b_spins))
         s.setValue(f"{SETTINGS}/out", self.out[1].text().strip())
-        s.setValue(f"{SETTINGS}/model", self.model[1].text().strip())
-        s.setValue(f"{SETTINGS}/mask_model", self.mask_model[1].text().strip())
         s.setValue(f"{SETTINGS}/auto_apply", "true" if self.auto_apply.isChecked() else "false")
+        s.setValue(f"{SETTINGS}/mask_intermediate",
+                   "true" if self.mask_intermediate.isChecked() else "false")
+        s.setValue(f"{SETTINGS}/types_intermediate",
+                   "true" if self.types_intermediate.isChecked() else "false")
+        s.setValue(f"{SETTINGS}/reuse_mask",
+                   "true" if self.reuse_mask.isChecked() else "false")
         s.setValue(f"{SETTINGS}/slots", "|".join(str(sl["combo"].currentData() or "") for sl in self.slots))
 
     # ------------------------------------------------------------- run
@@ -380,7 +389,9 @@ class ForestChangeDialog(QDialog):
             QApplication.setOverrideCursor(_WAIT_CURSOR)
             summary = core.compute_mask("files" if self._mode() == "slots" else "period",
                                         out_dir, progress=self._progress(),
-                                        mask_model=self.mask_model[1].text().strip(),
+                                        mask_model=DEFAULT_MASK_MODEL,
+                                        use_intermediate=self.mask_intermediate.isChecked(),
+                                        force_mask=not self.reuse_mask.isChecked(),
                                         **self._params())
             rl = QgsRasterLayer(summary["mask_tif"], "Маска изменений")
             if rl.isValid():
@@ -399,7 +410,7 @@ class ForestChangeDialog(QDialog):
             QApplication.restoreOverrideCursor()
 
     def _run_types(self):
-        model = self.model[1].text().strip()
+        model = DEFAULT_MODEL
         out_dir = self.out[1].text().strip()
         if not os.path.exists(model):
             QMessageBox.warning(self, "Ошибка", f"Модель не найдена:\n{model}")
@@ -416,7 +427,9 @@ class ForestChangeDialog(QDialog):
             self.bar.setValue(0)
             QApplication.setOverrideCursor(_WAIT_CURSOR)
             summary = core.predict("files" if self._mode() == "slots" else "period",
-                                   model, out_dir, progress=self._progress(), **self._params())
+                                   model, out_dir, progress=self._progress(),
+                                   use_intermediate=self.types_intermediate.isChecked(),
+                                   **self._params())
             self._load_results(summary)
             self.status.setText(
                 f"Готово (маска: {summary.get('used_mask') or 'пересчитана'}). "
@@ -429,7 +442,7 @@ class ForestChangeDialog(QDialog):
             QApplication.restoreOverrideCursor()
 
     def _run_all(self):
-        model = self.model[1].text().strip()
+        model = DEFAULT_MODEL
         out_dir = self.out[1].text().strip()
         if not os.path.exists(model):
             QMessageBox.warning(self, "Ошибка", f"Модель не найдена:\n{model}")
@@ -447,8 +460,13 @@ class ForestChangeDialog(QDialog):
             QApplication.setOverrideCursor(_WAIT_CURSOR)
             mode = "files" if self._mode() == "slots" else "period"
             m = core.compute_mask(mode, out_dir,
-                                  mask_model=self.mask_model[1].text().strip(), **self._params())
-            summary = core.predict(mode, model, out_dir, progress=self._progress(), **self._params())
+                                  mask_model=DEFAULT_MASK_MODEL,
+                                  use_intermediate=self.mask_intermediate.isChecked(),
+                                  force_mask=not self.reuse_mask.isChecked(),
+                                  **self._params())
+            summary = core.predict(mode, model, out_dir, progress=self._progress(),
+                                   use_intermediate=self.types_intermediate.isChecked(),
+                                   **self._params())
             self._load_results(summary)
             self.status.setText(
                 f"Готово. Маска: {m['changed_ha']:.1f} га. Клеток: {summary.get('cells', 0)}. "
