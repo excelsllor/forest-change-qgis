@@ -19,7 +19,7 @@ except AttributeError:  # Qt5
 from . import periods
 
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model")
-DEFAULT_MODEL = os.path.join(MODEL_DIR, "typenet_cfc_vozh_tex.onnx")
+DEFAULT_MODEL = os.path.join(MODEL_DIR, "typenet_cfc.onnx")
 DEFAULT_MASK_MODEL = os.path.join(MODEL_DIR, "masknet_cfc.onnx")
 BANDS6 = ("B02", "B03", "B04", "B08", "B11", "B12")
 SETTINGS = "forest_change"
@@ -48,7 +48,7 @@ class ForestChangeDialog(QDialog):
         super().__init__(iface.mainWindow())
         self.iface = iface
         self.setWindowTitle("Forest Change Detection (DOFA+CfC)")
-        self.resize(680, 640)
+        self.resize(680, 700)
         self.slots = []
         self._build()
         self._restore()
@@ -67,6 +67,12 @@ class ForestChangeDialog(QDialog):
         for label, _key in PROVIDERS:
             self.provider.addItem(label)
         form.addRow("Провайдер (onnxruntime)", self.provider)
+
+        self.area_preset = QComboBox()
+        self.area_preset.addItem("Стандарт: dNDVI<0.10 / dNBR>0.05", "standard")
+        self.area_preset.addItem("Консервативный: dNDVI<0.15 / dNBR>0.10", "conservative")
+        self.area_preset.addItem("Агрессивный: dNDVI<0.20 / dNBR>0.15", "aggressive")
+        form.addRow("Порог площади (3-я маска)", self.area_preset)
 
         # --- slots: loaded rasters
         self.slots_box = QVBoxLayout()
@@ -149,6 +155,9 @@ class ForestChangeDialog(QDialog):
         b_types = QPushButton("2. Посчитать изменение по маске (модель)")
         b_types.clicked.connect(self._run_types)
         root.addWidget(b_types)
+        b_area = QPushButton("3. Пиксельная площадь (dNDVI/dNBR)")
+        b_area.clicked.connect(self._run_area)
+        root.addWidget(b_area)
         b_all = QPushButton("Маска + изменение (всё сразу)")
         b_all.clicked.connect(self._run_all)
         root.addWidget(b_all)
@@ -315,6 +324,10 @@ class ForestChangeDialog(QDialog):
             str(s.value(f"{SETTINGS}/types_intermediate", "true")).lower() == "true")
         self.reuse_mask.setChecked(
             str(s.value(f"{SETTINGS}/reuse_mask", "true")).lower() == "true")
+        key = str(s.value(f"{SETTINGS}/area_preset", "standard"))
+        idx = self.area_preset.findData(key)
+        if idx >= 0:
+            self.area_preset.setCurrentIndex(idx)
         saved_slots = [x for x in str(s.value(f"{SETTINGS}/slots", "")).split("|") if x]
         while len(self.slots) < max(2, len(saved_slots)):
             self._add_slot()
@@ -339,6 +352,7 @@ class ForestChangeDialog(QDialog):
                    "true" if self.types_intermediate.isChecked() else "false")
         s.setValue(f"{SETTINGS}/reuse_mask",
                    "true" if self.reuse_mask.isChecked() else "false")
+        s.setValue(f"{SETTINGS}/area_preset", str(self.area_preset.currentData()))
         s.setValue(f"{SETTINGS}/slots", "|".join(str(sl["combo"].currentData() or "") for sl in self.slots))
 
     # ------------------------------------------------------------- run
@@ -402,7 +416,8 @@ class ForestChangeDialog(QDialog):
                     self.iface.mapCanvas().refresh()
             self.status.setText(
                 f"Маска готова: изменённых пикселей {summary['changed_px']} "
-                f"({summary['changed_ha']:.1f} га), порог {summary['thr']}. Файл: {summary['mask_tif']}")
+                f"({summary['changed_ha']:.1f} га), порог маски {summary.get('mask_thr', 0.5)}. "
+                f"Файл: {summary['mask_tif']}")
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Ошибка", f"{exc}\n\n{traceback.format_exc()}")
             self.status.setText("Ошибка: " + str(exc))
@@ -435,6 +450,45 @@ class ForestChangeDialog(QDialog):
                 f"Готово (маска: {summary.get('used_mask') or 'пересчитана'}). "
                 f"Клеток: {summary.get('cells', 0)}. Площади (га): " +
                 ", ".join(f"{k}={v:.1f}" for k, v in summary["areas_ha"].items()))
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Ошибка", f"{exc}\n\n{traceback.format_exc()}")
+            self.status.setText("Ошибка: " + str(exc))
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _run_area(self):
+        out_dir = self.out[1].text().strip()
+        if not out_dir:
+            QMessageBox.warning(self, "Ошибка", "Укажите папку вывода (маски)")
+            return
+        if not os.path.exists(os.path.join(out_dir, "mask.tif")):
+            QMessageBox.warning(self, "Ошибка", "Сначала посчитайте маску (шаг 1).")
+            return
+        if not self._check_inputs():
+            return
+        self._save()
+        try:
+            from . import core
+            self.status.setText("Считаю пиксельную маску площади…")
+            self.bar.setValue(0)
+            QApplication.setOverrideCursor(_WAIT_CURSOR)
+            summary = core.compute_disturbance(
+                "files" if self._mode() == "slots" else "period",
+                out_dir, progress=self._progress(),
+                preset=str(self.area_preset.currentData()),
+                **self._params())
+            rl = QgsRasterLayer(summary["disturbance_tif"], "Площадь: пиксели 10 м")
+            if rl.isValid():
+                QgsProject.instance().addMapLayer(rl)
+                self._style_disturbance(rl)
+                if self.auto_apply.isChecked():
+                    self.iface.mapCanvas().setExtent(rl.extent())
+                    self.iface.mapCanvas().refresh()
+            self.status.setText(
+                f"Площадь: {summary['disturbance_ha']:.1f} га "
+                f"(чиповая {summary['chip_ha']:.1f} га). "
+                f"{summary['dates'][0]} → {summary['dates'][1]}, "
+                f"{self.area_preset.currentText()}. Файл: {summary['disturbance_tif']}")
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Ошибка", f"{exc}\n\n{traceback.format_exc()}")
             self.status.setText("Ошибка: " + str(exc))
@@ -538,3 +592,11 @@ class ForestChangeDialog(QDialog):
                                (3, QColor(255, 0, 255, 255), "fire"),
                                (255, trans, "nodata")])
         layer.setOpacity(1.0)
+
+    def _style_disturbance(self, layer):
+        """1 = pixel disturbance, 0/255 fully transparent."""
+        trans = QColor(0, 0, 0, 0)
+        self._paletted(layer, [(0, trans, "изменено, но не повреждено"),
+                               (1, QColor(255, 140, 0, 255), "повреждение (dNDVI/dNBR)"),
+                               (255, trans, "вне маски/облака")])
+        layer.setOpacity(0.95)

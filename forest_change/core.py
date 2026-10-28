@@ -1,4 +1,4 @@
-"""Core inference for the Forest Change QGIS plugin (distilled CNN + CfC, CPU).
+﻿"""Core inference for the Forest Change QGIS plugin (distilled CNN + CfC, CPU).
 
 TILED pipeline: the AOI is processed in windows (TILE_PX, a multiple of CHIP), so
 only a fragment of each date is held in RAM at a time (bounded ~0.3 GB for 1024 px
@@ -66,6 +66,8 @@ MASK_BATCH = 128       # chips per model call
 DT_CANON = (0.0, 0.72, 1.15, 1.0)   # years between the canonical mosaic dates
 DATE_RE = None         # compiled lazily in _parse_date
 CHANGE_THR = 0.15  # |dNDVI| / |dNBR| threshold of the algorithmic change gate
+MASK_PROB_THR = 0.24  # one-DOFA mask probability threshold (EA-tuned)
+TYPE_BIAS = np.array([0.0, 1.5, 0.0], np.float32)  # type logit bias (EA post-processing)
 GATE_MODE = os.environ.get("FC_GATE", "fixed").lower()   # fixed | adaptive | both
 GATE_Z = float(os.environ.get("FC_GATE_Z", "4.0"))       # robust z-score threshold (adaptive)
 CHANGE_FRAC = 0.02 # chip is changed if at least this fraction of pixels changed
@@ -82,7 +84,7 @@ def pick_providers(preferred="auto"):
     want = PROVIDER_MAP.get(str(preferred or "auto").lower(), PROVIDER_ORDER)
     got = [p for p in want if p in avail]
     if not got:
-        print(f"[forest_change] провайдер '{preferred}' недоступен (есть: {avail}), использую CPU",
+        print(f"[forest_change] РїСЂРѕРІР°Р№РґРµСЂ '{preferred}' РЅРµРґРѕСЃС‚СѓРїРµРЅ (РµСЃС‚СЊ: {avail}), РёСЃРїРѕР»СЊР·СѓСЋ CPU",
               flush=True)
         got = ["CPUExecutionProvider"]
     return got
@@ -158,11 +160,11 @@ def _boa_sample(src, key, bands):
         return
     if _BOA_ENV in ("raw", "none", "off"):
         _BOA_MODE[key] = False
-        print(f"[forest_change] радиометрия {key}: FC_BOA=raw (без +0.1)", flush=True)
+        print(f"[forest_change] СЂР°РґРёРѕРјРµС‚СЂРёСЏ {key}: FC_BOA=raw (Р±РµР· +0.1)", flush=True)
         return
     if _BOA_ENV in ("corrected", "offset", "on"):
         _BOA_MODE[key] = True
-        print(f"[forest_change] радиометрия {key}: FC_BOA=corrected (+0.1)", flush=True)
+        print(f"[forest_change] СЂР°РґРёРѕРјРµС‚СЂРёСЏ {key}: FC_BOA=corrected (+0.1)", flush=True)
         return
     try:
         w, h = src.RasterXSize, src.RasterYSize
@@ -183,15 +185,15 @@ def _boa_sample(src, key, bands):
         return
     _BOA_MODE[key] = fix
     if fix:
-        print(f"[forest_change] радиометрия {key}: вход без BOA offset -> +0.1 "
+        print(f"[forest_change] СЂР°РґРёРѕРјРµС‚СЂРёСЏ {key}: РІС…РѕРґ Р±РµР· BOA offset -> +0.1 "
               f"(p0.5={lo:.3f})", flush=True)
     else:
-        print(f"[forest_change] радиометрия {key}: сырой L2A DN "
+        print(f"[forest_change] СЂР°РґРёРѕРјРµС‚СЂРёСЏ {key}: СЃС‹СЂРѕР№ L2A DN "
               f"(p0.5={lo:.3f})", flush=True)
     if amb:
         _BOA_AMBIG[key] = lo
-        print(f"[forest_change] ВНИМАНИЕ {key}: p0.5={lo:.3f} в серой зоне 0.06-0.09 — "
-              f"конвенция BOA неоднозначна; задайте FC_BOA=raw|corrected", flush=True)
+        print(f"[forest_change] Р’РќРРњРђРќРР• {key}: p0.5={lo:.3f} РІ СЃРµСЂРѕР№ Р·РѕРЅРµ 0.06-0.09 вЂ” "
+              f"РєРѕРЅРІРµРЅС†РёСЏ BOA РЅРµРѕРґРЅРѕР·РЅР°С‡РЅР°; Р·Р°РґР°Р№С‚Рµ FC_BOA=raw|corrected", flush=True)
 
 
 def _boa_fix_raw(a, key):
@@ -208,16 +210,16 @@ def _series_warning(labels, dt, mode):
     msgs = []
     pos = dt[1:][dt[1:] > 0]
     if pos.size and (float(pos.min()) < 0.5 or float(pos.max()) > 1.3):
-        msgs.append(f"dt {float(pos.min()):.2f}..{float(pos.max()):.2f} лет вне 0.5-1.3")
+        msgs.append(f"dt {float(pos.min()):.2f}..{float(pos.max()):.2f} Р»РµС‚ РІРЅРµ 0.5-1.3")
     parsed = [_parse_date(l) for l in labels]
     if labels and all(parsed):
         months = sorted({p[1] for p in parsed})
         if not set(months) <= {5, 6, 7, 9}:
-            msgs.append(f"месяцы {months} вне [05,06,07,09]")
+            msgs.append(f"РјРµСЃСЏС†С‹ {months} РІРЅРµ [05,06,07,09]")
     elif labels:
-        msgs.append("даты не распознаны — сезон/интервалы не проверены")
+        msgs.append("РґР°С‚С‹ РЅРµ СЂР°СЃРїРѕР·РЅР°РЅС‹ вЂ” СЃРµР·РѕРЅ/РёРЅС‚РµСЂРІР°Р»С‹ РЅРµ РїСЂРѕРІРµСЂРµРЅС‹")
     if msgs:
-        msg = "ВНИМАНИЕ (files): " + "; ".join(msgs) + " — результат вне распределения обучения"
+        msg = "Р’РќРРњРђРќРР• (files): " + "; ".join(msgs) + " вЂ” СЂРµР·СѓР»СЊС‚Р°С‚ РІРЅРµ СЂР°СЃРїСЂРµРґРµР»РµРЅРёСЏ РѕР±СѓС‡РµРЅРёСЏ"
         print(f"[forest_change] {msg}", flush=True)
         return msg
     return None
@@ -274,10 +276,10 @@ def _read_stack(path, band_idx, c0, r0, w, h):
     if bad:
         del ds
         raise ValueError(
-            f"{os.path.basename(path)}: запрошены каналы {list(band_idx)}, "
-            f"но в файле только {n} канал(ов).\n"
-            "Укажите корректные номера: для 6-канального стека — 1,2,3,4,5,6; "
-            "для Sentinel-2 L2A — 2,3,4,8,11,12 (B02,B03,B04,B08,B11,B12).")
+            f"{os.path.basename(path)}: Р·Р°РїСЂРѕС€РµРЅС‹ РєР°РЅР°Р»С‹ {list(band_idx)}, "
+            f"РЅРѕ РІ С„Р°Р№Р»Рµ С‚РѕР»СЊРєРѕ {n} РєР°РЅР°Р»(РѕРІ).\n"
+            "РЈРєР°Р¶РёС‚Рµ РєРѕСЂСЂРµРєС‚РЅС‹Рµ РЅРѕРјРµСЂР°: РґР»СЏ 6-РєР°РЅР°Р»СЊРЅРѕРіРѕ СЃС‚РµРєР° вЂ” 1,2,3,4,5,6; "
+            "РґР»СЏ Sentinel-2 L2A вЂ” 2,3,4,8,11,12 (B02,B03,B04,B08,B11,B12).")
     out = np.zeros((len(band_idx), h, w), dtype=np.float32)
     for i, b in enumerate(band_idx):
         out[i] = ds.GetRasterBand(b).ReadAsArray(c0, r0, w, h)
@@ -300,9 +302,9 @@ def _mosaic_vrt(mosaic_dir, date):
     for p in srcs:
         if not os.path.exists(p):
             raise ValueError(
-                f"В папке мозаик нет файла «{os.path.basename(p)}».\n"
-                f"Папка: {mosaic_dir}\nОжидаются файлы <дата>_<канал>.tif для каналов "
-                f"{', '.join(BANDS6)} и <дата>_SCL.tif по датам {', '.join(SEQ_DATES)}.")
+                f"Р’ РїР°РїРєРµ РјРѕР·Р°РёРє РЅРµС‚ С„Р°Р№Р»Р° В«{os.path.basename(p)}В».\n"
+                f"РџР°РїРєР°: {mosaic_dir}\nРћР¶РёРґР°СЋС‚СЃСЏ С„Р°Р№Р»С‹ <РґР°С‚Р°>_<РєР°РЅР°Р»>.tif РґР»СЏ РєР°РЅР°Р»РѕРІ "
+                f"{', '.join(BANDS6)} Рё <РґР°С‚Р°>_SCL.tif РїРѕ РґР°С‚Р°Рј {', '.join(SEQ_DATES)}.")
     vrt = gdal.BuildVRT(f"/vsimem/fc_{abs(hash(key))}.vrt", srcs,
                         options=gdal.BuildVRTOptions(separate=True))
     _VRT_CACHE[key] = vrt
@@ -313,7 +315,7 @@ def _read_mosaic6(mosaic_dir, date, c0, r0, w, h):
     vrt = _mosaic_vrt(mosaic_dir, date)
     arr = vrt.ReadAsArray(c0, r0, w, h)
     if arr is None:
-        raise IOError(f"Не удалось прочитать окно {w}x{h} ({date}) в мозаике {mosaic_dir}")
+        raise IOError(f"РќРµ СѓРґР°Р»РѕСЃСЊ РїСЂРѕС‡РёС‚Р°С‚СЊ РѕРєРЅРѕ {w}x{h} ({date}) РІ РјРѕР·Р°РёРєРµ {mosaic_dir}")
     key = f"{os.path.basename(mosaic_dir)}/{date}"
     _boa_sample(vrt, key, list(range(1, vrt.RasterCount + 1)))
     return _boa_fix_raw(arr, key)
@@ -362,7 +364,7 @@ def _setup(mode, period=None, mosaic_dir=None, files=None, t1_path=None, t2_path
             fl = [t1_path, t2_path]
         fl = [p for p in fl if os.path.exists(p)]
         if len(fl) < 2:
-            raise ValueError("Нужно выбрать минимум 2 снимка (pre и post) из загруженных слоёв.")
+            raise ValueError("РќСѓР¶РЅРѕ РІС‹Р±СЂР°С‚СЊ РјРёРЅРёРјСѓРј 2 СЃРЅРёРјРєР° (pre Рё post) РёР· Р·Р°РіСЂСѓР¶РµРЅРЅС‹С… СЃР»РѕС‘РІ.")
         date1, date2 = "T1", "T2"
         ref = fl[0]
         check = fl
@@ -521,14 +523,13 @@ class MaskCtxModel:
     def provider(self):
         return self.sess.get_providers()[0]
 
-    def run(self, feats, ctx, valid, dt, doy, lengths):
-        """feats (M,T,256), ctx (M,T,3,3,256), valid (M,T,3,3), lengths (M,) -> (M,2)."""
+    def run(self, feats, ctx, valid, dt, doy):
+        """feats (M,T,768), ctx (M,T,3,3,768), valid (M,T,3,3) -> (M,2)."""
         return self.sess.run(None, {"feats": feats.astype(np.float32),
                                     "ctx": ctx.astype(np.float32),
-                                    "valid": valid.astype(np.float32),
+                                    "valid": np.asarray(valid, dtype=bool),
                                     "dt": dt.astype(np.float32),
-                                    "doy": doy.astype(np.float32),
-                                    "lengths": lengths.astype(np.int64)})[0]
+                                    "doy": doy.astype(np.float32)})[0]
 
 
 class EncoderModel:
@@ -563,16 +564,23 @@ class TypeCfCModel:
         with open(path, "rb") as fh:
             buf = fh.read()
         self.sess = ort.InferenceSession(buf, providers=["CPUExecutionProvider"])
+        self.has_ctx = any(i.name == "ctx" for i in self.sess.get_inputs())
+        self.has_tex = any(i.name == "tex" for i in self.sess.get_inputs())
         self.has_spec = any(i.name == "spec" for i in self.sess.get_inputs())
 
     @property
     def provider(self):
         return self.sess.get_providers()[0]
 
-    def run(self, feats, dt, doy, spec=None):
+    def run(self, feats, ctx, valid, dt, doy, tex, spec):
         feed = {"feats": feats.astype(np.float32),
                 "dt": dt.astype(np.float32),
                 "doy": doy.astype(np.float32)}
+        if self.has_ctx:
+            feed["ctx"] = ctx.astype(np.float32)
+            feed["valid"] = np.asarray(valid, dtype=bool)
+        if self.has_tex:
+            feed["tex"] = tex.astype(np.float32)
         if self.has_spec:
             feed["spec"] = spec.astype(np.float32)
         return self.sess.run(None, feed)[0]
@@ -588,7 +596,7 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
     32 px chip (up to 8 dates, zero padded) with dt (years) and doy (sin/cos/year).
     """
     if not mask_model or not os.path.exists(mask_model):
-        raise ValueError(f"Модель маски не найдена: {mask_model}")
+        raise ValueError(f"РњРѕРґРµР»СЊ РјР°СЃРєРё РЅРµ РЅР°Р№РґРµРЅР°: {mask_model}")
     _BOA_MODE.clear()
     _BOA_AMBIG.clear()
     os.makedirs(out_dir, exist_ok=True)
@@ -604,12 +612,12 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
         dt_sel[k] = float(dt_all[sel[k - 1] + 1:sel[k] + 1].sum())
     doy_sel = np.stack([_doy3(l, year=(kind != "mosaic")) for l in labels]) \
         if labels else np.zeros((0, 3), np.float32)
-    print(f"[forest_change] маска: {len(sel)} дат из {len(dt_all)} (первая/последняя сохранены), "
-          f"модель {os.path.basename(mask_model)}", flush=True)
+    print(f"[forest_change] РјР°СЃРєР°: {len(sel)} РґР°С‚ РёР· {len(dt_all)} (РїРµСЂРІР°СЏ/РїРѕСЃР»РµРґРЅСЏСЏ СЃРѕС…СЂР°РЅРµРЅС‹), "
+          f"РјРѕРґРµР»СЊ {os.path.basename(mask_model)}", flush=True)
 
-    enc_path = os.path.join(os.path.dirname(mask_model), "masknet_encoder.onnx")
+    enc_path = os.path.join(os.path.dirname(mask_model), "typenet_encoder.onnx")
     if not os.path.exists(enc_path):
-        raise ValueError(f"Энкодер маски не найден рядом с моделью: {enc_path}")
+        raise ValueError(f"DOFA-СЌРЅРєРѕРґРµСЂ РЅРµ РЅР°Р№РґРµРЅ СЂСЏРґРѕРј СЃ РјР°СЃРєРѕР№: {enc_path}")
     src_sig = []
     if mode == "period":
         for l in labels:
@@ -622,10 +630,11 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
             if pth and os.path.exists(pth):
                 src_sig.append((os.path.basename(pth), os.path.getmtime(pth)))
     cache_key = hashlib.md5(json.dumps({
-        "v": 2, "mode": mode, "period": period, "labels": labels,
+        "v": 4, "mode": mode, "period": period, "labels": labels,
         "dt": [round(float(x), 4) for x in dt_sel],
         "inter": bool(use_intermediate),
         "thr": float(thr if thr is not None else CHANGE_THR),
+        "mask_thr": float(MASK_PROB_THR),
         "model": os.path.getmtime(mask_model), "enc": os.path.getmtime(enc_path),
         "src": src_sig, "aoi": [s["c0"], s["r0"], s["w"], s["h"]],
         "band_idx": list(band_idx) if band_idx else None,
@@ -640,8 +649,8 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
             if cached.get("key") == cache_key:
                 summary = cached["summary"]
                 summary["cached"] = True
-                print(f"[forest_change] маска: кэш ({summary.get('changed_ha', 0):.1f} га) — "
-                      f"пропускаю расчёт", flush=True)
+                print(f"[forest_change] РјР°СЃРєР°: РєСЌС€ ({summary.get('changed_ha', 0):.1f} РіР°) вЂ” "
+                      f"РїСЂРѕРїСѓСЃРєР°СЋ СЂР°СЃС‡С‘С‚", flush=True)
                 return summary
         except Exception:
             pass
@@ -651,7 +660,7 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
     tiles = _tiles(s["w"], s["h"])
     enc = EncoderModel(enc_path, provider)
     model = MaskCtxModel(mask_model, provider)
-    print(f"[forest_change] маска: энкодер {os.path.basename(enc_path)} + attention-контекст 3x3 "
+    print(f"[forest_change] РјР°СЃРєР°: СЌРЅРєРѕРґРµСЂ {os.path.basename(enc_path)} + attention-РєРѕРЅС‚РµРєСЃС‚ 3x3 "
           f"+ CfC {os.path.basename(mask_model)}", flush=True)
     changed_chips = 0
     invalid_px = 0
@@ -663,13 +672,14 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
     def flush():
         for feats, ctx, cval, dtb, doyb, pos in buf:
             n = len(feats)
-            ln = np.full(n, feats.shape[1], np.int64)      # all selected dates are valid
             for i0 in range(0, n, 512):
                 logits = model.run(feats[i0:i0 + 512], ctx[i0:i0 + 512],
                                    cval[i0:i0 + 512], dtb[i0:i0 + 512],
-                                   doyb[i0:i0 + 512], ln[i0:i0 + 512])
-                for j in range(logits.shape[0]):
-                    if int(np.argmax(logits[j])) == 1:
+                                   doyb[i0:i0 + 512])
+                logits = np.asarray(logits, dtype=np.float32).reshape(-1)
+                probs = 1.0 / (1.0 + np.exp(-logits))
+                for j in range(probs.shape[0]):
+                    if float(probs[j]) > MASK_PROB_THR:
                         cells_changed.append(pos[i0 + j])
         buf.clear()
 
@@ -697,7 +707,7 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
         invalid = np.zeros((th, tw), bool)
         nc, nr = ew // CHIP, eh // CHIP
         ox, oy = x - hx0, y - hy0
-        grid = np.zeros((len(labels), nr, nc, 256), np.float32)
+        grid = np.zeros((len(labels), nr, nc, 768), np.float32)
         gvalid = np.zeros((len(labels), nr, nc), bool)
         series = []
         for li, (bands, scl) in enumerate(reads):
@@ -708,10 +718,10 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
             chips = b.reshape(6, nr, CHIP, nc, CHIP).transpose(1, 3, 0, 2, 4)
             chips = np.ascontiguousarray(chips).reshape(nr * nc, 6, CHIP, CHIP)
             gvalid[li] = (chips.sum(axis=(1, 2, 3)) > 0).reshape(nr, nc)
-            f = np.empty((nr * nc, 256), np.float32)
+            f = np.empty((nr * nc, 768), np.float32)
             for i0 in range(0, nr * nc, 512):
                 f[i0:i0 + 512] = enc.run(chips[i0:i0 + 512])
-            grid[li] = f.reshape(nr, nc, 256)
+            grid[li] = f.reshape(nr, nc, 768)
         first_i = series[0][:, oy:oy + th, ox:ox + tw]
         last_i = series[-1][:, oy:oy + th, ox:ox + tw]
         invalid |= (first_i[3] == 0) | (last_i[3] == 0)
@@ -730,12 +740,12 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
                 gg0 = (x - hx0) // CHIP
                 rows = g0 + sel[:, 0]
                 cols = gg0 + sel[:, 1]
-                pad = np.zeros((Tn, nr + 2, nc + 2, 256), np.float32)
+                pad = np.zeros((Tn, nr + 2, nc + 2, 768), np.float32)
                 pad[:, 1:-1, 1:-1] = grid
                 pv = np.zeros((Tn, nr + 2, nc + 2), bool)
                 pv[:, 1:-1, 1:-1] = gvalid
                 feats = grid[:, rows, cols].transpose(1, 0, 2)          # (n,T,256)
-                ctx = np.empty((n, Tn, 3, 3, 256), np.float32)
+                ctx = np.empty((n, Tn, 3, 3, 768), np.float32)
                 cval = np.empty((n, Tn, 3, 3), bool)
                 for dj in (-1, 0, 1):
                     for di in (-1, 0, 1):
@@ -775,6 +785,7 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
                "boa_checked": len(_BOA_MODE), "boa_mode": _BOA_ENV,
                "series_warning": warn, "intermediate_mask": bool(use_intermediate),
                "cached": False, "thr": float(thr if thr is not None else CHANGE_THR),
+               "mask_thr": float(MASK_PROB_THR),
                "tile_px": TILE_PX, "tiles": len(tiles),
                "changed_chips": changed_chips, "changed_px": changed_chips * CHIP * CHIP,
                "invalid_px": invalid_px,
@@ -823,6 +834,91 @@ def _mask_windows(change, chip=CHIP, block=BLOCK):
             yield r0, c0, r1, c1
 
 
+def compute_disturbance(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_path=None,
+                        t2_path=None, band_idx=None, aoi_bbox=None, progress=None,
+                        mask_path=None, preset="standard"):
+    """Pixel-level disturbance mask inside the model-changed chips (dNDVI/dNBR).
+
+    Third mask for an approximate affected area: for the first/last dates of the series,
+    flags 10 m pixels with dNDVI < -th_d or dNBR > th_b (and SCL/forest validity) inside
+    the model mask (chip-level). Output disturbance.tif: 1 disturbed, 0 changed-but-valid,
+    255 outside the model mask / invalid. Presets: standard (0.10/0.05), conservative
+    (0.15/0.10), aggressive (0.20/0.15); area = px * 0.01 ha.
+    """
+    _BOA_MODE.clear()
+    _BOA_AMBIG.clear()
+    os.makedirs(out_dir, exist_ok=True)
+    s = _setup(mode, period, mosaic_dir, files, t1_path, t2_path, aoi_bbox)
+    if mode != "period":
+        s["series_files"] = list(files or []) or ([t1_path, t2_path] if t1_path else [])
+    labels, _dt_all, _kind, _paths = _series_for(s, mode, None)
+    if len(labels) < 2:
+        raise ValueError("Р”Р»СЏ РїРёРєСЃРµР»СЊРЅРѕР№ РјР°СЃРєРё РЅСѓР¶РЅРѕ РјРёРЅРёРјСѓРј 2 РґР°С‚С‹")
+    if mode == "period":
+        pre_l = s.get("date1") or labels[0]
+        post_l = s.get("date2") or labels[-1]
+        if pre_l not in labels or post_l not in labels:
+            pre_l, post_l = labels[0], labels[-1]
+    else:
+        pre_l, post_l = labels[0], labels[-1]
+    if preset == "conservative":
+        th_d, th_b = 0.15, 0.10
+    elif preset == "aggressive":
+        th_d, th_b = 0.20, 0.15
+    else:
+        th_d, th_b = 0.10, 0.05
+    mask_file = mask_path or os.path.join(out_dir, "mask.tif")
+    if not os.path.exists(mask_file):
+        raise ValueError(f"РњР°СЃРєР° РЅРµ РЅР°Р№РґРµРЅР°: {mask_file}")
+    mgt, _, _, _ = _grid_from(mask_file)
+    mask_dx = int(round((s["gt"][0] + s["c0"] * s["gt"][1] - mgt[0]) / s["gt"][1]))
+    mask_dy = int(round((s["gt"][3] + s["r0"] * s["gt"][5] - mgt[3]) / s["gt"][5]))
+    path = os.path.join(out_dir, "disturbance.tif")
+    ds = _create_raster(path, s["gt"], s["c0"], s["r0"], s["w"], s["h"], s["proj"])
+    band = ds.GetRasterBand(1)
+    tiles = _tiles(s["w"], s["h"])
+    dist_px = chip_px = 0
+    for ti, (x, y, tw, th) in enumerate(tiles):
+        pre_b, pre_scl = _series_read(mode, s, band_idx, pre_l, s["c0"] + x, s["r0"] + y, tw, th)
+        post_b, post_scl = _series_read(mode, s, band_idx, post_l, s["c0"] + x, s["r0"] + y, tw, th)
+        m = _read_band1(mask_file, mask_dx + x, mask_dy + y, tw, th)
+        b1 = pre_b.astype(np.float32) / SCALE
+        b2 = post_b.astype(np.float32) / SCALE
+        nd1 = (b1[3] - b1[2]) / np.maximum(b1[3] + b1[2], 1e-6)
+        nd2 = (b2[3] - b2[2]) / np.maximum(b2[3] + b2[2], 1e-6)
+        nb1 = (b1[3] - b1[5]) / np.maximum(b1[3] + b1[5], 1e-6)
+        nb2 = (b2[3] - b2[5]) / np.maximum(b2[3] + b2[5], 1e-6)
+        valid = np.ones((th, tw), bool)
+        if pre_scl is not None:
+            valid &= ~np.isin(pre_scl, SCL_INVALID)
+        if post_scl is not None:
+            valid &= ~np.isin(post_scl, SCL_INVALID)
+        valid &= (nd1 > FOREST_NDVI_MIN) | (nd2 > FOREST_NDVI_MIN)
+        changed = m == 1
+        dist = valid & changed & (((nd2 - nd1) < -th_d) | ((nb1 - nb2) > th_b))
+        out = np.full((th, tw), 255, np.uint8)
+        out[valid & changed] = 0
+        out[dist] = 1
+        band.WriteArray(out, x, y)
+        dist_px += int(dist.sum())
+        chip_px += int(changed.sum())
+        if progress:
+            progress(int(100 * (ti + 1) / len(tiles)))
+    band = None
+    ds = None
+    summary = {"disturbance_tif": path, "preset": preset,
+               "th_dndvi": th_d, "th_dnbr": th_b, "dates": [pre_l, post_l],
+               "disturbance_px": dist_px, "disturbance_ha": dist_px * 0.01,
+               "chip_ha": chip_px * 0.01,
+               "ratio_to_chips": dist_px / max(chip_px, 1)}
+    with open(os.path.join(out_dir, "disturbance_summary.json"), "w", encoding="utf-8") as fh:
+        json.dump(summary, fh, indent=2, ensure_ascii=False)
+    print(f"[forest_change] РїР»РѕС‰Р°РґСЊ: {summary['disturbance_ha']:.1f} РіР° "
+          f"({preset}: dNDVI<-{th_d}, dNBR>{th_b}) РІРЅСѓС‚СЂРё {summary['chip_ha']:.1f} РіР° С‡РёРїРѕРІ",
+          flush=True)
+    return summary
+
+
 def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None, t1_path=None,
             t2_path=None, band_idx=None, aoi_bbox=None, progress=None, mask_path=None,
             provider="auto", use_intermediate=True):
@@ -849,7 +945,7 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
         mask_dy = int(round((gt[3] + r0 * gt[5] - mgt[3]) / gt[5]))
     enc_path = os.path.join(os.path.dirname(model_path), "typenet_encoder.onnx")
     if not os.path.exists(enc_path):
-        raise ValueError(f"Энкодер типов не найден рядом с моделью: {enc_path}")
+        raise ValueError(f"Р­РЅРєРѕРґРµСЂ С‚РёРїРѕРІ РЅРµ РЅР°Р№РґРµРЅ СЂСЏРґРѕРј СЃ РјРѕРґРµР»СЊСЋ: {enc_path}")
     labels, dt_all, kind, paths = _series_for(s, mode, None)
     warn = _series_warning(labels, dt_all, mode)
     sel = _select_dates(len(labels), keep_intermediate=use_intermediate)
@@ -875,11 +971,11 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
         _zf = _zc["feats"][:]
         _zk = _zc["keys"][:]
         fcache = {(int(a), int(b)): _zf[i] for i, (a, b) in enumerate(_zk)}
-        print(f"[forest_change] кэш фич типов: {len(fcache)} чипов "
+        print(f"[forest_change] РєСЌС€ С„РёС‡ С‚РёРїРѕРІ: {len(fcache)} С‡РёРїРѕРІ "
               f"({os.path.basename(cache_path)})", flush=True)
-    print(f"[forest_change] типы: TypeNet (энкодер {os.path.basename(enc_path)} + "
-          f"cross-attention readout {os.path.basename(model_path)}, динамическое T, "
-          f"readout на CPU{', texture 9' if cfc.has_spec else ''}), {len(labels)} дат",
+    print(f"[forest_change] С‚РёРїС‹: TypeNet (СЌРЅРєРѕРґРµСЂ {os.path.basename(enc_path)} + "
+          f"cross-attention readout {os.path.basename(model_path)}, РґРёРЅР°РјРёС‡РµСЃРєРѕРµ T, "
+          f"readout РЅР° CPU{', texture 9' if cfc.has_spec else ''}), {len(labels)} РґР°С‚",
           flush=True)
     cells = []
     tiles = _tiles(w, h)
@@ -892,9 +988,10 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
         if not pend:
             return
         chips = pend[0][0] if len(pend) == 1 else np.concatenate([p[0] for p in pend], 0)
-        dtb = pend[0][1] if len(pend) == 1 else np.concatenate([p[1] for p in pend], 0)
-        doyb = pend[0][2] if len(pend) == 1 else np.concatenate([p[2] for p in pend], 0)
-        pos = [q for p in pend for q in p[3]]
+        ctxc = pend[0][1] if len(pend) == 1 else np.concatenate([p[1] for p in pend], 0)
+        dtb = pend[0][2] if len(pend) == 1 else np.concatenate([p[2] for p in pend], 0)
+        doyb = pend[0][3] if len(pend) == 1 else np.concatenate([p[3] for p in pend], 0)
+        pos = [q for p in pend for q in p[4]]
         M, D = chips.shape[0], chips.shape[1]
         keys = [(int(r0 + rr), int(c0 + cc)) for (rr, cc) in pos]
         feats = np.empty((M, D, 768), np.float32)
@@ -911,16 +1008,26 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
         for i, k_ in enumerate(keys):
             if k_ not in miss and i not in miss:
                 feats[i] = fcache[k_]
-        specb = None
-        if cfc.has_spec:
-            specb = np.zeros((M, D, 9), np.float32)
-            for i in range(M):
-                for d in range(D):
-                    specb[i, d] = _texture9(np.clip(chips[i, d], 0.0, 1.5))
+        C = ctxc.shape[1]
+        cf = np.empty((M, C, D, 768), np.float32)
+        flatc = ctxc.reshape(M * C * D, 6, CHIP, CHIP)
+        for i0 in range(0, M * C * D, 512):
+            cf.reshape(-1, 768)[i0:i0 + 512] = enc.run(flatc[i0:i0 + 512])
+        ctx = cf.reshape(M, 3, 3, D, 768).transpose(0, 3, 1, 2, 4)
+        valid = np.ones((M, D, 3, 3), np.float32)
+        texb = np.empty((M, D, 9), np.float32)
+        specb = np.empty((M, D, 9), np.float32)
+        for i in range(M):
+            for d in range(D):
+                texb[i, d] = _texture9(np.clip(chips[i, d], 0.0, 1.5))
+                specb[i, d] = _features9(chips[i, d] * SCALE).mean(axis=(1, 2))
         for i0 in range(0, M, 512):
-            logits = cfc.run(feats[i0:i0 + 512], dtb[i0:i0 + 512], doyb[i0:i0 + 512],
-                             None if specb is None else specb[i0:i0 + 512])
-            probs = _softmax(np.asarray(logits, dtype=np.float32))
+            logits = cfc.run(feats[i0:i0 + 512], ctx[i0:i0 + 512],
+                             valid[i0:i0 + 512], dtb[i0:i0 + 512],
+                             doyb[i0:i0 + 512], texb[i0:i0 + 512],
+                             specb[i0:i0 + 512])
+            logits = np.asarray(logits, dtype=np.float32) + TYPE_BIAS
+            probs = _softmax(logits)
             for j in range(logits.shape[0]):
                 k = int(logits[j].argmax()) + 1       # 0/1/2 -> logging/windfall/fire
                 rr, cc = pos[i0 + j]
@@ -939,11 +1046,22 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
         if len(sel) == 0:
             return
         chips = np.empty((len(sel), D, 6, CHIP, CHIP), np.float32)
+        ctxc = np.empty((len(sel), 9, D, 6, CHIP, CHIP), np.float32)
         for li in range(D):
             b = series[li][:, :nh * CHIP, :nw * CHIP].astype(np.float32) / SCALE
             arr = b.reshape(6, nh, CHIP, nw, CHIP).transpose(1, 3, 0, 2, 4)
             chips[:, li] = arr[sel[:, 0], sel[:, 1]]
-        pend.append((chips, np.tile(dt_sel, (len(sel), 1)),
+        for n, (i, j) in enumerate(sel):
+            for dj in (-1, 0, 1):
+                for di in (-1, 0, 1):
+                    ii = min(max(int(i) + dj, 0), nh - 1)
+                    jj = min(max(int(j) + di, 0), nw - 1)
+                    k = (dj + 1) * 3 + (di + 1)
+                    for li in range(D):
+                        ctxc[n, k, li] = series[li][
+                            :, ii * CHIP:(ii + 1) * CHIP,
+                            jj * CHIP:(jj + 1) * CHIP].astype(np.float32) / SCALE
+        pend.append((chips, ctxc, np.tile(dt_sel, (len(sel), 1)),
                      np.tile(doy_sel, (len(sel), 1, 1)),
                      [(ay + int(j) * CHIP, ax + int(i) * CHIP) for j, i in sel]))
         pend_n[0] += len(sel)
@@ -1010,8 +1128,8 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
         _ck = np.array(list(fcache.keys()), np.int32)
         _cf = np.stack([fcache[k_] for k_ in fcache]).astype(np.float16)
         np.savez(cache_path, keys=_ck, feats=_cf)
-        print(f"[forest_change] кэш фич типов сохранён: {len(fcache)} чипов "
-              f"({os.path.getsize(cache_path) / 1e6:.0f} МБ)", flush=True)
+        print(f"[forest_change] РєСЌС€ С„РёС‡ С‚РёРїРѕРІ СЃРѕС…СЂР°РЅС‘РЅ: {len(fcache)} С‡РёРїРѕРІ "
+              f"({os.path.getsize(cache_path) / 1e6:.0f} РњР‘)", flush=True)
     band = None
     ds_out = None
     if hasattr(cfc, "close"):
@@ -1032,6 +1150,7 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
                "boa_checked": len(_BOA_MODE), "boa_mode": _BOA_ENV,
                "series_warning": warn, "intermediate_types": bool(use_intermediate),
                "chip": CHIP, "tile_px": TILE_PX, "scale_m": gt[1], "change_thr": CHANGE_THR,
+               "type_bias": [float(x) for x in TYPE_BIAS],
                "cells": len(cells),
                "used_mask": os.path.basename(mask_file) if use_mask else None,
                "areas_ha": n_px,
@@ -1120,3 +1239,4 @@ def _polygonize(classes_path, gpkg_path, proj):
         feat.SetField("area_ha", area)
         layer.SetFeature(feat)
     dst = None
+
