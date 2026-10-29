@@ -68,6 +68,8 @@ DATE_RE = None         # compiled lazily in _parse_date
 CHANGE_THR = 0.15  # |dNDVI| / |dNBR| threshold of the algorithmic change gate
 MASK_PROB_THR = 0.24  # one-DOFA mask probability threshold (EA-tuned)
 TYPE_BIAS = np.array([0.0, 1.5, 0.0], np.float32)  # type logit bias (EA post-processing)
+UNET_THR = 0.438  # CfC U-Net pixel threshold (EA)
+UNET_MIN_PX = 11  # remove components smaller than this (EA)
 GATE_MODE = os.environ.get("FC_GATE", "fixed").lower()   # fixed | adaptive | both
 GATE_Z = float(os.environ.get("FC_GATE_Z", "4.0"))       # robust z-score threshold (adaptive)
 CHANGE_FRAC = 0.02 # chip is changed if at least this fraction of pixels changed
@@ -834,16 +836,56 @@ def _mask_windows(change, chip=CHIP, block=BLOCK):
             yield r0, c0, r1, c1
 
 
+class CfcUNetModel:
+    """CfC U-Net pixel mask (ONNX, CPU): (M,T,9,32,32) -> (M,32,32) logits."""
+
+    def __init__(self, path):
+        import onnxruntime as ort
+        with open(path, "rb") as fh:
+            buf = fh.read()
+        self.sess = ort.InferenceSession(buf, providers=["CPUExecutionProvider"])
+
+    def run(self, x, dt, lengths):
+        return self.sess.run(None, {"x": x.astype(np.float32),
+                                    "dt": dt.astype(np.float32),
+                                    "lengths": lengths.astype(np.int64)})[0]
+
+
+def _remove_small(mask, min_px):
+    """8-connected component filter on a 2D bool mask."""
+    h, w = mask.shape
+    seen = np.zeros((h, w), bool)
+    out = np.zeros((h, w), bool)
+    for sy in range(h):
+        for sx in range(w):
+            if not mask[sy, sx] or seen[sy, sx]:
+                continue
+            stack = [(sy, sx)]
+            seen[sy, sx] = True
+            comp = []
+            while stack:
+                y, x = stack.pop()
+                comp.append((y, x))
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        ny, nx = y + dy, x + dx
+                        if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                            seen[ny, nx] = True
+                            stack.append((ny, nx))
+            if len(comp) >= min_px:
+                for y, x in comp:
+                    out[y, x] = True
+    return out
+
+
 def compute_disturbance(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_path=None,
                         t2_path=None, band_idx=None, aoi_bbox=None, progress=None,
-                        mask_path=None, preset="standard"):
-    """Pixel-level disturbance mask inside the model-changed chips (dNDVI/dNBR).
+                        mask_path=None, preset="standard", unet_model=None):
+    """Pixel-level disturbance mask: CfC U-Net inside the model-changed chips.
 
-    Third mask for an approximate affected area: for the first/last dates of the series,
-    flags 10 m pixels with dNDVI < -th_d or dNBR > th_b (and SCL/forest validity) inside
-    the model mask (chip-level). Output disturbance.tif: 1 disturbed, 0 changed-but-valid,
-    255 outside the model mask / invalid. Presets: standard (0.10/0.05), conservative
-    (0.15/0.10), aggressive (0.20/0.15); area = px * 0.01 ha.
+    The U-Net consumes all selected dates (T, 9 features: 6 bands + NDVI/NBR/NDMI)
+    for every 32 px chip, threshold 0.438 + component filter min_px=11 (EA).
+    Falls back to dNDVI/dNBR if the ONNX is missing.
     """
     _BOA_MODE.clear()
     _BOA_AMBIG.clear()
@@ -851,25 +893,19 @@ def compute_disturbance(mode, out_dir, period=None, mosaic_dir=None, files=None,
     s = _setup(mode, period, mosaic_dir, files, t1_path, t2_path, aoi_bbox)
     if mode != "period":
         s["series_files"] = list(files or []) or ([t1_path, t2_path] if t1_path else [])
-    labels, _dt_all, _kind, _paths = _series_for(s, mode, None)
+    labels, dt_all, _kind, _paths = _series_for(s, mode, None)
     if len(labels) < 2:
-        raise ValueError("Р”Р»СЏ РїРёРєСЃРµР»СЊРЅРѕР№ РјР°СЃРєРё РЅСѓР¶РЅРѕ РјРёРЅРёРјСѓРј 2 РґР°С‚С‹")
-    if mode == "period":
-        pre_l = s.get("date1") or labels[0]
-        post_l = s.get("date2") or labels[-1]
-        if pre_l not in labels or post_l not in labels:
-            pre_l, post_l = labels[0], labels[-1]
-    else:
-        pre_l, post_l = labels[0], labels[-1]
-    if preset == "conservative":
-        th_d, th_b = 0.15, 0.10
-    elif preset == "aggressive":
-        th_d, th_b = 0.20, 0.15
-    else:
-        th_d, th_b = 0.10, 0.05
+        raise ValueError("Для пиксельной маски нужно минимум 2 даты")
     mask_file = mask_path or os.path.join(out_dir, "mask.tif")
     if not os.path.exists(mask_file):
-        raise ValueError(f"РњР°СЃРєР° РЅРµ РЅР°Р№РґРµРЅР°: {mask_file}")
+        raise ValueError(f"Маска не найдена: {mask_file}")
+    unet_path = unet_model or os.path.join(os.path.dirname(os.path.abspath(__file__)), "model", "cfc_unet_p3.onnx")
+    use_unet = os.path.exists(unet_path)
+    unet = CfcUNetModel(unet_path) if use_unet else None
+    T = len(labels)
+    dt_sel = np.zeros(T, np.float32)
+    for k in range(1, T):
+        dt_sel[k] = float(dt_all[k])
     mgt, _, _, _ = _grid_from(mask_file)
     mask_dx = int(round((s["gt"][0] + s["c0"] * s["gt"][1] - mgt[0]) / s["gt"][1]))
     mask_dy = int(round((s["gt"][3] + s["r0"] * s["gt"][5] - mgt[3]) / s["gt"][5]))
@@ -879,43 +915,62 @@ def compute_disturbance(mode, out_dir, period=None, mosaic_dir=None, files=None,
     tiles = _tiles(s["w"], s["h"])
     dist_px = chip_px = 0
     for ti, (x, y, tw, th) in enumerate(tiles):
-        pre_b, pre_scl = _series_read(mode, s, band_idx, pre_l, s["c0"] + x, s["r0"] + y, tw, th)
-        post_b, post_scl = _series_read(mode, s, band_idx, post_l, s["c0"] + x, s["r0"] + y, tw, th)
+        reads = []
+        for label in labels:
+            b, scl = _series_read(mode, s, band_idx, label, s["c0"] + x, s["r0"] + y, tw, th)
+            reads.append(b)
         m = _read_band1(mask_file, mask_dx + x, mask_dy + y, tw, th)
-        b1 = pre_b.astype(np.float32) / SCALE
-        b2 = post_b.astype(np.float32) / SCALE
-        nd1 = (b1[3] - b1[2]) / np.maximum(b1[3] + b1[2], 1e-6)
-        nd2 = (b2[3] - b2[2]) / np.maximum(b2[3] + b2[2], 1e-6)
-        nb1 = (b1[3] - b1[5]) / np.maximum(b1[3] + b1[5], 1e-6)
-        nb2 = (b2[3] - b2[5]) / np.maximum(b2[3] + b2[5], 1e-6)
-        valid = np.ones((th, tw), bool)
-        if pre_scl is not None:
-            valid &= ~np.isin(pre_scl, SCL_INVALID)
-        if post_scl is not None:
-            valid &= ~np.isin(post_scl, SCL_INVALID)
-        valid &= (nd1 > FOREST_NDVI_MIN) | (nd2 > FOREST_NDVI_MIN)
         changed = m == 1
-        dist = valid & changed & (((nd2 - nd1) < -th_d) | ((nb1 - nb2) > th_b))
         out = np.full((th, tw), 255, np.uint8)
-        out[valid & changed] = 0
-        out[dist] = 1
-        band.WriteArray(out, x, y)
-        dist_px += int(dist.sum())
         chip_px += int(changed.sum())
+        if use_unet:
+            nh, nw = th // CHIP, tw // CHIP
+            if nh and nw:
+                sel = np.argwhere(changed[:nh * CHIP, :nw * CHIP].reshape(
+                    nh, CHIP, nw, CHIP).any(axis=(1, 3)))
+                if len(sel):
+                    xb = np.empty((len(sel), T, 9, CHIP, CHIP), np.float32)
+                    for t in range(T):
+                        for k, (i, j) in enumerate(sel):
+                            xb[k, t] = _features9(
+                                reads[t][:, i * CHIP:(i + 1) * CHIP, j * CHIP:(j + 1) * CHIP])
+                    p = unet.run(xb, np.tile(dt_sel, (len(sel), 1)),
+                                 np.full(len(sel), T, np.int64))
+                    p = 1.0 / (1.0 + np.exp(-np.asarray(p, np.float32)))
+                    for k, (i, j) in enumerate(sel):
+                        pred = _remove_small(p[k] > UNET_THR, UNET_MIN_PX)
+                        rr, cc = i * CHIP, j * CHIP
+                        out[rr:rr + CHIP, cc:cc + CHIP] = pred.astype(np.uint8)
+                        dist_px += int(pred.sum())
+        else:
+            b1 = reads[0].astype(np.float32) / SCALE
+            b2 = reads[-1].astype(np.float32) / SCALE
+            nd1 = (b1[3] - b1[2]) / np.maximum(b1[3] + b1[2], 1e-6)
+            nd2 = (b2[3] - b2[2]) / np.maximum(b2[3] + b2[2], 1e-6)
+            nb1 = (b1[3] - b1[5]) / np.maximum(b1[3] + b1[5], 1e-6)
+            nb2 = (b2[3] - b2[5]) / np.maximum(b2[3] + b2[5], 1e-6)
+            dist = changed & (((nd2 - nd1) < -0.10) | ((nb1 - nb2) > 0.05))
+            out[changed] = 0
+            out[dist] = 1
+            dist_px += int(dist.sum())
+        out[~changed] = 255
+        band.WriteArray(out, x, y)
         if progress:
             progress(int(100 * (ti + 1) / len(tiles)))
     band = None
     ds = None
-    summary = {"disturbance_tif": path, "preset": preset,
-               "th_dndvi": th_d, "th_dnbr": th_b, "dates": [pre_l, post_l],
+    summary = {"disturbance_tif": path, "method": "cfc_unet_ea" if use_unet else "spectral",
+               "preset": preset,
+               "unet_thr": float(UNET_THR) if use_unet else None,
+               "unet_min_px": int(UNET_MIN_PX) if use_unet else None,
+               "dates": labels,
                "disturbance_px": dist_px, "disturbance_ha": dist_px * 0.01,
                "chip_ha": chip_px * 0.01,
                "ratio_to_chips": dist_px / max(chip_px, 1)}
     with open(os.path.join(out_dir, "disturbance_summary.json"), "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2, ensure_ascii=False)
-    print(f"[forest_change] РїР»РѕС‰Р°РґСЊ: {summary['disturbance_ha']:.1f} РіР° "
-          f"({preset}: dNDVI<-{th_d}, dNBR>{th_b}) РІРЅСѓС‚СЂРё {summary['chip_ha']:.1f} РіР° С‡РёРїРѕРІ",
-          flush=True)
+    print(f"[forest_change] площадь: {summary['disturbance_ha']:.1f} га "
+          f"({summary['method']}) внутри {summary['chip_ha']:.1f} га чипов", flush=True)
     return summary
 
 
@@ -1239,4 +1294,5 @@ def _polygonize(classes_path, gpkg_path, proj):
         feat.SetField("area_ha", area)
         layer.SetFeature(feat)
     dst = None
+
 

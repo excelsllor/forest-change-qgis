@@ -1,9 +1,9 @@
-[general]
+﻿[general]
 name=Forest Change Detection (DOFA+CfC)
 qgisMinimumVersion=3.16
 qgisMaximumVersion=4.99
-description=Forest change detection on a single DOFA-distilled encoder (768-d): the mask (DOFA features + 3x3 cross-attention context + one Bi-CfC block + attention readout, val F1 0.925, p3 0.906) and the type classifier (same encoder + 3x3 context + two Bi-CfC blocks + attention readout + texture/spectral features; val acc 0.936, macro01 0.868, p3 macro01 0.909) share one ONNX encoder. An optional pixel-level dNDVI/dNBR mask estimates the affected area in hectares. All models and onnxruntime are bundled; caches and intermediate-date toggles are supported.
-version=0.20.0
+description=Forest change detection on a single DOFA-distilled encoder (768-d): the mask (DOFA features + 3x3 cross-attention context + one Bi-CfC block + attention readout, val F1 0.925, p3 0.906) and the type classifier (same encoder + 3x3 context + two Bi-CfC blocks + attention readout + texture/spectral features; val acc 0.936, macro01 0.868, p3 macro01 0.909) share one ONNX encoder. The third mask is now a CfC U-Net at 10 m (developed CfCBiBlock + attention, threshold 0.438, min_px 11) inside the changed chips, reporting the affected area; dNDVI/dNBR is the fallback. All models and onnxruntime are bundled; caches and intermediate-date toggles are supported.
+version=0.21.0
 author=Forest Hackathon Team
 email=team@example.com
 about=One DOFA-distilled 768-d encoder is shared by two models: the change mask (3x3 cross-attention context + one Bi-CfC block + attention readout; val F1 0.925, p3 0.906) and the change type (logging/windfall/fire; 3x3 context + two Bi-CfC blocks + attention readout + texture9/spectral9; val acc 0.936, macro01 0.868, p3 macro01 0.909). Dynamic T 2-8, length-aware CfC, dt/doy, SCL/NDVI validity; the optional third pixel-level dNDVI/dNBR mask reports the affected area; outputs are the class raster, polygons, cells layer and disturbance.tif. Models + bundled onnxruntime (DML/CPU); mask/type caches; intermediate-date toggles.
@@ -12,3 +12,4 @@ repository=https://github.com/excelsllor/forest-change-qgis
 tags=forest,change detection,dofa,vit,remote sensing
 category=Analysis
 icon=icon.png
+

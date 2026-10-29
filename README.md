@@ -8,7 +8,7 @@
 EA-Р±РёР°СЃР° +1.5; РјСѓР»СЊС‚Рё-РґР°С‚Р°СЃРµС‚РЅР°СЏ РІРµСЂСЃРёСЏ вЂ” macro-F1 0.911). Р“РµРѕРѕР±СЂР°Р±РѕС‚РєР° вЂ” GDAL/OGR, РёРЅС„РµСЂРµРЅСЃ вЂ” onnxruntime
 (CPU РёР»Рё DirectML/CUDA СЃ Р°РІС‚Рѕ-РѕС‚РєР°С‚РѕРј РЅР° CPU).
 
-Р¤РёРЅР°Р»СЊРЅС‹Рµ РјРѕРґРµР»Рё (v0.20.0): СЃРј. [forest-change-model v5.1](https://github.com/excelsllor/forest-change-model)
+Р¤РёРЅР°Р»СЊРЅС‹Рµ РјРѕРґРµР»Рё (v0.21.0): СЃРј. [forest-change-model v5.2](https://github.com/excelsllor/forest-change-model)
 (С‚Р°Рј Р¶Рµ РїРѕСЃР»РѕР№РЅС‹Рµ РѕРїРёСЃР°РЅРёСЏ `MODEL_MASK_ARCH.md`/`MODEL_TYPES_ARCH.md`, Р±Р»РѕРє-СЃС…РµРјС‹ Рё РєРѕРґ).
 
 РЎС…РµРјС‹: [РјР°СЃРєР°](https://github.com/excelsllor/forest-change-model/blob/master/docs/10_mask_final_bicfcpn_big.png) В·
@@ -51,7 +51,7 @@ EA-Р±РёР°СЃР° +1.5; РјСѓР»СЊС‚Рё-РґР°С‚Р°СЃР�
 
 РўСЂРµР±СѓРµС‚СЃСЏ QGIS 3.16+ (РїСЂРѕРІРµСЂРµРЅРѕ РЅР° 3.44 LTR, Python 3.12).
 
-1. СЃРєР°С‡Р°Р№С‚Рµ `forest_change_plugin_v0.20.0.zip` РёР·
+1. СЃРєР°С‡Р°Р№С‚Рµ `forest_change_plugin_v0.21.0.zip` РёР·
    [Releases РїР»Р°РіРёРЅР°](https://github.com/excelsllor/forest-change-qgis/releases);
 2. QGIS в†’ *РњРѕРґСѓР»Рё в†’ РЈРїСЂР°РІР»РµРЅРёРµ РјРѕРґСѓР»СЏРјРё в†’ РЈСЃС‚Р°РЅРѕРІРёС‚СЊ РёР· ZIP* в†’ РІС‹Р±РµСЂРёС‚Рµ С„Р°Р№Р»;
 3. РІРєР»СЋС‡РёС‚Рµ РјРѕРґСѓР»СЊ В«Forest Change Detection (DOFA+CfC)В».
@@ -60,7 +60,7 @@ EA-Р±РёР°СЃР° +1.5; РјСѓР»СЊС‚Рё-РґР°С‚Р°СЃР�
 `vendor/` (63 РњР‘), РјРѕРґРµР»Рё вЂ” `masknet_encoder.onnx` (5.5 РњР‘), `masknet_cfc.onnx` (4.7 РњР‘),
 `typenet_encoder.onnx` (30.3 РњР‘), `typenet_cfc_vozh_tex.onnx` (9.3 РњР‘). Р’С‹Р±РѕСЂР° РјРѕРґРµР»РµР№ РІ UI РЅРµС‚:
 РїР»Р°РіРёРЅ РІСЃРµРіРґР° РёСЃРїРѕР»СЊР·СѓРµС‚ СЌС‚Рё С„РёРЅР°Р»СЊРЅС‹Рµ РІРµСЂСЃРёРё. Р§РµРєРїРѕРёРЅС‚С‹ Рё РєРѕРґ вЂ”
-[forest-change-model v5.1](https://github.com/excelsllor/forest-change-model).
+[forest-change-model v5.2](https://github.com/excelsllor/forest-change-model).
 
 ## РљР°Рє РїСЂРѕРІРµСЂРёС‚СЊ
 
@@ -203,4 +203,6 @@ forest_change/
   model/          masknet_encoder/masknet_cfc/typenet_encoder/typenet_cfc_vozh_tex (.onnx)
   vendor/         onnxruntime 1.24.4 (DirectML + CPU), РІСЃС‚СЂРѕРµРЅ
 ```
+
+
 
