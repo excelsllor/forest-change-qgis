@@ -1,4 +1,4 @@
-﻿"""Core inference for the Forest Change QGIS plugin (distilled CNN + CfC, CPU).
+"""Core inference for the Forest Change QGIS plugin (distilled CNN + CfC, CPU).
 
 TILED pipeline: the AOI is processed in windows (TILE_PX, a multiple of CHIP), so
 only a fragment of each date is held in RAM at a time (bounded ~0.3 GB for 1024 px
@@ -60,9 +60,7 @@ PROVIDER_MAP = {
     "openvino": ["CPUExecutionProvider"],
     "ov": ["CPUExecutionProvider"],
     "openvino-bf16": ["CPUExecutionProvider"],
-    "openvino-int8": ["CPUExecutionProvider"],
     "ov-bf16": ["CPUExecutionProvider"],
-    "ov-int8": ["CPUExecutionProvider"],
 }
 CHIP = 32          # 320 m at 10 m resolution (same scale as the training chips)
 SCALE = 10000.0
@@ -93,6 +91,8 @@ THREADS = max(1, int(os.environ.get("FC_THREADS",
                                     str(max(1, (os.cpu_count() or 8) // 2)))))
 OV_BATCH = max(1, int(os.environ.get("FC_OV_BATCH", str(RUN_BATCH))))
 OV_PRECISION = os.environ.get("FC_OV_PRECISION", "f32").strip().lower()
+if OV_PRECISION not in ("f32", "bf16"):
+    OV_PRECISION = "f32"
 FEATURE_STORE = os.environ.get("FC_FEATURES", "1").strip().lower() not in (
     "0", "false", "off", "no")
 FEATURE_DTYPE = os.environ.get("FC_FEATURE_DTYPE", "f32").strip().lower()
@@ -826,7 +826,7 @@ class MaskCtxModel:
 
 
 class OpenVINOEncoder:
-    """Encoder on the OpenVINO CPU plugin (f32 default, bf16/int8 optional)."""
+    """Encoder on the OpenVINO CPU plugin (f32 default, bf16 optional)."""
 
     def __init__(self, path, precision=None):
         import openvino as ov
@@ -836,8 +836,7 @@ class OpenVINOEncoder:
         model.reshape({"vol": [OV_BATCH, 6, CHIP, CHIP]})
         cfg = {"INFERENCE_NUM_THREADS": THREADS, "NUM_STREAMS": 1,
                "PERFORMANCE_HINT": "THROUGHPUT"}
-        if self.precision != "int8":
-            cfg["INFERENCE_PRECISION_HINT"] = self.precision
+        cfg["INFERENCE_PRECISION_HINT"] = self.precision
         self.cm = self.core.compile_model(model, "CPU", cfg)
         self._provider = f"OpenVINO-CPU-{self.precision}"
         try:
@@ -877,15 +876,10 @@ class EncoderModel:
         pref = str(provider or "auto").lower()
         ov_precision = None
         ov_path = path
-        if pref in ("openvino-int8", "ov-int8"):
-            ov_path = os.path.join(os.path.dirname(path),
-                                   "typenet_encoder_int8_ov.xml")
-            ov_precision = "int8"
-            pref = "openvino"
-        elif pref in ("openvino-bf16", "ov-bf16"):
+        if pref in ("openvino-bf16", "ov-bf16"):
             ov_precision = "bf16"
             pref = "openvino"
-        if pref in ("auto", "openvino", "ov", "cpu-openvino"):
+        if pref in ("openvino", "ov", "cpu-openvino"):
             try:
                 self._ov = OpenVINOEncoder(ov_path, precision=ov_precision)
                 return
@@ -1252,7 +1246,7 @@ class CfcUNetModel:
         self._ov = None
         self.sess = None
         if str(provider or "auto").lower() in ("openvino", "ov", "cpu-openvino",
-                                               "openvino-bf16", "openvino-int8"):
+                                               "openvino-bf16"):
             try:
                 self._ov = OpenVINOCfcUNet(path)
                 return
@@ -1790,5 +1784,3 @@ def _polygonize(classes_path, gpkg_path, proj):
         src = None
         if os.path.exists(tmp):
             os.remove(tmp)
-
-

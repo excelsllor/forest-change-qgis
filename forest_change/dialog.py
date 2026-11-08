@@ -28,12 +28,11 @@ DEFAULT_MASK_MODEL = os.path.join(MODEL_DIR, "masknet_cfc.onnx")
 BANDS6 = ("B02", "B03", "B04", "B08", "B11", "B12")
 SETTINGS = "forest_change"
 DATE_RE = re.compile(r"(20\d{2})[-_./]?(\d{2})(?:[-_./]?(\d{2}))?")
-PROVIDERS = [("Авто (OpenVINO CPU f32 → ORT)", "auto"),
-             ("OpenVINO CPU (f32)", "openvino"),
-             ("OpenVINO CPU (bf16, быстрее)", "openvino-bf16"),
-             ("OpenVINO CPU (int8, проверить качество)", "openvino-int8"),
+PROVIDERS = [("Auto (DML/CPU)", "auto"),
+             ("DirectML", "dml"),
              ("CPU (ONNX Runtime)", "cpu"),
-             ("DirectML", "dml")]
+             ("OpenVINO CPU (f32, optional)", "openvino"),
+             ("OpenVINO CPU (bf16, optional)", "openvino-bf16")]
 
 
 def parse_date(text):
