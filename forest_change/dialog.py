@@ -1,5 +1,9 @@
+import json
 import os
 import re
+import shutil
+import subprocess
+import sys
 import traceback
 
 from qgis.PyQt.QtWidgets import (
@@ -24,7 +28,12 @@ DEFAULT_MASK_MODEL = os.path.join(MODEL_DIR, "masknet_cfc.onnx")
 BANDS6 = ("B02", "B03", "B04", "B08", "B11", "B12")
 SETTINGS = "forest_change"
 DATE_RE = re.compile(r"(20\d{2})[-_./]?(\d{2})(?:[-_./]?(\d{2}))?")
-PROVIDERS = [("Авто", "auto"), ("CPU", "cpu"), ("DirectML", "dml")]
+PROVIDERS = [("Авто (OpenVINO CPU f32 → ORT)", "auto"),
+             ("OpenVINO CPU (f32)", "openvino"),
+             ("OpenVINO CPU (bf16, быстрее)", "openvino-bf16"),
+             ("OpenVINO CPU (int8, проверить качество)", "openvino-int8"),
+             ("CPU (ONNX Runtime)", "cpu"),
+             ("DirectML", "dml")]
 
 
 def parse_date(text):
@@ -127,6 +136,9 @@ class ForestChangeDialog(QDialog):
 
         self.out = self._path_row(dir_mode=True)
         form.addRow("Папка вывода (маски)", self.out[0])
+        clear_cache = QPushButton("Очистить кэш признаков")
+        clear_cache.clicked.connect(self._clear_features)
+        form.addRow("", clear_cache)
 
         self.auto_apply = QCheckBox("Сразу накладывать маски на карту и приближать к ним")
         self.auto_apply.setChecked(True)
@@ -375,6 +387,74 @@ class ForestChangeDialog(QDialog):
             QApplication.processEvents()
         return progress
 
+    def _run_worker(self, stage):
+        out_dir = self.out[1].text().strip()
+        params = self._params()
+        payload = {"stage": stage, "out_dir": out_dir,
+                   "provider": params.get("provider", "auto")}
+        for key in ("period", "mosaic_dir", "files", "band_idx", "aoi_bbox"):
+            if key in params:
+                payload[key] = params[key]
+        if stage in ("mask", "all"):
+            payload["use_intermediate"] = self.mask_intermediate.isChecked()
+            payload["mask_intermediate"] = self.mask_intermediate.isChecked()
+            payload["force_mask"] = not self.reuse_mask.isChecked()
+        if stage in ("types", "all"):
+            payload["types_intermediate"] = self.types_intermediate.isChecked()
+        if stage == "area":
+            payload["preset"] = str(self.area_preset.currentData())
+        here = os.path.dirname(os.path.abspath(__file__))
+        root = os.path.dirname(here)
+        env = os.environ.copy()
+        env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
+        env["PYTHONUNBUFFERED"] = "1"
+        env.setdefault("MALLOC_ARENA_MAX", "2")
+        cmd = [sys.executable, "-m", "forest_change.worker",
+               json.dumps(payload, ensure_ascii=False)]
+        proc = subprocess.Popen(cmd, cwd=root, env=env,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                                text=True, bufsize=1)
+        result = None
+        error = None
+        logs = []
+        for line in proc.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                logs.append(line)
+                continue
+            if "progress" in obj:
+                self.bar.setValue(int(obj["progress"]))
+                QApplication.processEvents()
+            elif "result" in obj:
+                result = obj["result"]
+            elif "error" in obj:
+                error = obj["error"]
+                if obj.get("traceback"):
+                    logs.append(obj["traceback"])
+        code = proc.wait()
+        if code != 0 or error is not None:
+            tail = "\n".join(logs[-40:])
+            raise RuntimeError((error or f"worker exit {code}") +
+                               (("\n\n" + tail) if tail else ""))
+        return result
+
+    def _clear_features(self):
+        out_dir = self.out[1].text().strip()
+        if not out_dir:
+            QMessageBox.warning(self, "Ошибка", "Укажите папку вывода (маски)")
+            return
+        path = os.path.join(out_dir, "features")
+        if not os.path.isdir(path):
+            QMessageBox.information(self, "Кэш", "Кэш признаков не найден")
+            return
+        shutil.rmtree(path, ignore_errors=True)
+        QMessageBox.information(self, "Кэш", "Кэш признаков удалён")
+
     def _check_inputs(self):
         if self.mode.currentIndex() == 0:
             paths = self._slot_paths()
@@ -397,16 +477,10 @@ class ForestChangeDialog(QDialog):
             return
         self._save()
         try:
-            from . import core
             self.status.setText("Считаю маску (модель)…")
             self.bar.setValue(0)
             QApplication.setOverrideCursor(_WAIT_CURSOR)
-            summary = core.compute_mask("files" if self._mode() == "slots" else "period",
-                                        out_dir, progress=self._progress(),
-                                        mask_model=DEFAULT_MASK_MODEL,
-                                        use_intermediate=self.mask_intermediate.isChecked(),
-                                        force_mask=not self.reuse_mask.isChecked(),
-                                        **self._params())
+            summary = self._run_worker("mask")
             rl = QgsRasterLayer(summary["mask_tif"], "Маска изменений")
             if rl.isValid():
                 QgsProject.instance().addMapLayer(rl)
@@ -437,14 +511,10 @@ class ForestChangeDialog(QDialog):
             return
         self._save()
         try:
-            from . import core
             self.status.setText("Классифицирую тип по маске…")
             self.bar.setValue(0)
             QApplication.setOverrideCursor(_WAIT_CURSOR)
-            summary = core.predict("files" if self._mode() == "slots" else "period",
-                                   model, out_dir, progress=self._progress(),
-                                   use_intermediate=self.types_intermediate.isChecked(),
-                                   **self._params())
+            summary = self._run_worker("types")
             self._load_results(summary)
             self.status.setText(
                 f"Готово (маска: {summary.get('used_mask') or 'пересчитана'}). "
@@ -468,15 +538,10 @@ class ForestChangeDialog(QDialog):
             return
         self._save()
         try:
-            from . import core
             self.status.setText("Считаю пиксельную маску площади…")
             self.bar.setValue(0)
             QApplication.setOverrideCursor(_WAIT_CURSOR)
-            summary = core.compute_disturbance(
-                "files" if self._mode() == "slots" else "period",
-                out_dir, progress=self._progress(),
-                preset=str(self.area_preset.currentData()),
-                **self._params())
+            summary = self._run_worker("area")
             rl = QgsRasterLayer(summary["disturbance_tif"], "Площадь: пиксели 10 м")
             if rl.isValid():
                 QgsProject.instance().addMapLayer(rl)
@@ -508,19 +573,11 @@ class ForestChangeDialog(QDialog):
             return
         self._save()
         try:
-            from . import core
             self.status.setText("Инференс (маска + тип)…")
             self.bar.setValue(0)
             QApplication.setOverrideCursor(_WAIT_CURSOR)
-            mode = "files" if self._mode() == "slots" else "period"
-            m = core.compute_mask(mode, out_dir,
-                                  mask_model=DEFAULT_MASK_MODEL,
-                                  use_intermediate=self.mask_intermediate.isChecked(),
-                                  force_mask=not self.reuse_mask.isChecked(),
-                                  **self._params())
-            summary = core.predict(mode, model, out_dir, progress=self._progress(),
-                                   use_intermediate=self.types_intermediate.isChecked(),
-                                   **self._params())
+            result = self._run_worker("all")
+            m, summary = result["mask"], result["types"]
             self._load_results(summary)
             self.status.setText(
                 f"Готово. Маска: {m['changed_ha']:.1f} га. Клеток: {summary.get('cells', 0)}. "

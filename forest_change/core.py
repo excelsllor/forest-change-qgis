@@ -32,11 +32,15 @@ import numpy as np
 from osgeo import gdal, ogr, osr
 
 _VENDOR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
-if os.path.isdir(os.path.join(_VENDOR, "onnxruntime")) and _VENDOR not in sys.path:
+# The bundled onnxruntime is a Windows build (DML/CPU); on other platforms the
+# system onnxruntime must be used instead, otherwise the vendor package shadows
+# it and the .pyd import fails.
+if sys.platform == "win32" and os.path.isdir(os.path.join(_VENDOR, "onnxruntime")) \
+        and _VENDOR not in sys.path:
     sys.path.insert(0, _VENDOR)
 
 gdal.UseExceptions()
-gdal.SetConfigOption("GDAL_CACHEMAX", "512")   # keep decompressed 512x512 blocks hot
+gdal.SetConfigOption("GDAL_CACHEMAX", os.environ.get("FC_GDAL_CACHE", "256"))
 
 CLASSES = {0: "no_change", 1: "logging", 2: "windfall", 3: "fire"}
 BANDS6 = ("B02", "B03", "B04", "B08", "B11", "B12")
@@ -53,6 +57,12 @@ PROVIDER_MAP = {
     "dml": ["DmlExecutionProvider", "CPUExecutionProvider"],
     "directml": ["DmlExecutionProvider", "CPUExecutionProvider"],
     "rocm": ["ROCMExecutionProvider", "CPUExecutionProvider"],
+    "openvino": ["CPUExecutionProvider"],
+    "ov": ["CPUExecutionProvider"],
+    "openvino-bf16": ["CPUExecutionProvider"],
+    "openvino-int8": ["CPUExecutionProvider"],
+    "ov-bf16": ["CPUExecutionProvider"],
+    "ov-int8": ["CPUExecutionProvider"],
 }
 CHIP = 32          # 320 m at 10 m resolution (same scale as the training chips)
 SCALE = 10000.0
@@ -77,6 +87,21 @@ MIN_AREA_HA = 0.0  # drop merged polygons smaller than this (0 = keep all)
 TILE_PX = int(os.environ.get("FC_TILE", "1024"))   # processing window (multiple of CHIP)
 SUBTILE = os.environ.get("FC_SUBTILE", "1") == "1"  # read only the mask bbox inside a tile
 BLOCK = max(CHIP, int(os.environ.get("FC_BLOCK", "128")) // CHIP * CHIP)  # mask block for reads
+RUN_BATCH = max(1, int(os.environ.get("FC_BATCH", "64")))          # encoder chips per call
+CFC_BATCH = max(1, int(os.environ.get("FC_CFC_BATCH", "128")))     # CfC chips per call
+THREADS = max(1, int(os.environ.get("FC_THREADS",
+                                    str(max(1, (os.cpu_count() or 8) // 2)))))
+OV_BATCH = max(1, int(os.environ.get("FC_OV_BATCH", str(RUN_BATCH))))
+OV_PRECISION = os.environ.get("FC_OV_PRECISION", "f32").strip().lower()
+FEATURE_STORE = os.environ.get("FC_FEATURES", "1").strip().lower() not in (
+    "0", "false", "off", "no")
+FEATURE_DTYPE = os.environ.get("FC_FEATURE_DTYPE", "f32").strip().lower()
+FEATURE_DIR = os.environ.get("FC_FEATURE_DIR", "").strip()
+FEATURE_MAX_MB = float(os.environ.get("FC_FEATURE_MAX_MB", "0") or 0)
+FC_COG = os.environ.get("FC_COG", "1").strip().lower() not in ("0", "false", "off", "no")
+FC_COG_FULL = os.environ.get("FC_COG_FULL", "0").strip().lower() not in (
+    "0", "false", "off", "no")
+COG_BLOCK = max(128, int(os.environ.get("FC_COG_BLOCK", "512")))
 
 
 def pick_providers(preferred="auto"):
@@ -90,6 +115,19 @@ def pick_providers(preferred="auto"):
               flush=True)
         got = ["CPUExecutionProvider"]
     return got
+
+
+def _ort_options():
+    """Bounded CPU session: physical-core threads, no growing arena, no copies."""
+    import onnxruntime as ort
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = THREADS
+    so.inter_op_num_threads = 1
+    so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    so.enable_cpu_mem_arena = False
+    so.enable_mem_pattern = True
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    return so
 
 
 def _ndvi(bands):
@@ -232,13 +270,18 @@ _DS_CACHE = {}
 
 
 def _gdal_open(path):
-    """Cached GDAL dataset (opening a 14k x 7k tiled TIFF costs ~2-5 ms per band)."""
-    ds = _DS_CACHE.get(path)
+    """Cached GDAL dataset, reopened when the file mtime changes."""
+    entry = _DS_CACHE.get(path)
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = None
+    if entry is not None and entry[1] == mtime:
+        return entry[0]
+    ds = gdal.Open(path)
     if ds is None:
-        ds = gdal.Open(path)
-        if ds is None:
-            raise IOError(f"Cannot open {path}")
-        _DS_CACHE[path] = ds
+        raise IOError(f"Cannot open {path}")
+    _DS_CACHE[path] = (ds, mtime)
     return ds
 
 
@@ -282,13 +325,260 @@ def _read_stack(path, band_idx, c0, r0, w, h):
             f"РЅРѕ РІ С„Р°Р№Р»Рµ С‚РѕР»СЊРєРѕ {n} РєР°РЅР°Р»(РѕРІ).\n"
             "РЈРєР°Р¶РёС‚Рµ РєРѕСЂСЂРµРєС‚РЅС‹Рµ РЅРѕРјРµСЂР°: РґР»СЏ 6-РєР°РЅР°Р»СЊРЅРѕРіРѕ СЃС‚РµРєР° вЂ” 1,2,3,4,5,6; "
             "РґР»СЏ Sentinel-2 L2A вЂ” 2,3,4,8,11,12 (B02,B03,B04,B08,B11,B12).")
-    out = np.zeros((len(band_idx), h, w), dtype=np.float32)
-    for i, b in enumerate(band_idx):
-        out[i] = ds.GetRasterBand(b).ReadAsArray(c0, r0, w, h)
+    interleave = ds.GetMetadataItem("INTERLEAVE")
+    if str(interleave or "").upper() == "PIXEL" and len(band_idx) > 1:
+        arr = ds.ReadAsArray(c0, r0, w, h)
+        if arr is None:
+            del ds
+            raise IOError(f"Cannot read {w}x{h} window from {path}")
+        if arr.ndim == 2:
+            arr = arr[None]
+        out = np.ascontiguousarray(arr[[int(b) - 1 for b in band_idx]],
+                                   dtype=np.float32)
+    else:
+        out = np.zeros((len(band_idx), h, w), dtype=np.float32)
+        for i, b in enumerate(band_idx):
+            out[i] = ds.GetRasterBand(b).ReadAsArray(c0, r0, w, h)
     key = os.path.abspath(path)
     _boa_sample(ds, key, band_idx)
     del ds
     return _boa_fix_raw(out, key)
+
+
+def _source_sig(mode, s, labels):
+    """Cheap source fingerprint: all bands/SCL mtimes for the requested dates."""
+    sig = []
+    if mode == "period":
+        md = s.get("mosaic_dir") or ""
+        for label in labels:
+            for b in BANDS6:
+                p = os.path.join(md, f"{label}_{b}.tif")
+                if os.path.exists(p):
+                    sig.append([os.path.abspath(p), os.path.getmtime(p)])
+            p = os.path.join(md, f"{label}_SCL.tif")
+            if os.path.exists(p):
+                sig.append([os.path.abspath(p), os.path.getmtime(p)])
+    else:
+        for p in (s.get("series_files") or []):
+            if p and os.path.exists(p):
+                sig.append([os.path.abspath(p), os.path.getmtime(p)])
+    return sig
+
+
+def _cog_inputs(files, aoi_bbox, out_dir):
+    """Optional AOI-cropped tiled COG cache for files-mode inputs."""
+    if not FC_COG or not files or (not aoi_bbox and not FC_COG_FULL):
+        return files, aoi_bbox
+    try:
+        ref = files[0]
+        gt, W, H, _proj = _grid_from(ref)
+        if aoi_bbox:
+            xmin, ymin, xmax, ymax = aoi_bbox
+            c0 = max(0, int((xmin - gt[0]) / gt[1]))
+            r0 = max(0, int((ymax - gt[3]) / gt[5]))
+            c1 = min(W, int((xmax - gt[0]) / gt[1]))
+            r1 = min(H, int((ymin - gt[3]) / gt[5]))
+        else:
+            c0, r0, c1, r1 = 0, 0, W, H
+        w, h = c1 - c0, r1 - r0
+        if w <= 0 or h <= 0:
+            return files, aoi_bbox
+        ds = _gdal_open(ref)
+        rb = ds.GetRasterBand(1)
+        bs = rb.GetBlockSize()
+        fp = rb.DataType in (gdal.GDT_Float32, gdal.GDT_Float64)
+        del ds
+        if c0 == 0 and r0 == 0 and w == W and h == H and bs[1] > 1 and bs[0] < W:
+            return files, aoi_bbox
+        cog_dir = os.path.join(out_dir, "cog")
+        os.makedirs(cog_dir, exist_ok=True)
+        block = max(16, min(COG_BLOCK, w, h) // 16 * 16)
+        out = []
+        for p in files:
+            stem = os.path.splitext(os.path.basename(p))[0]
+            tag = hashlib.md5(os.path.abspath(p).encode()).hexdigest()[:8]
+            dst = os.path.join(cog_dir, f"{stem}_{tag}_{c0}_{r0}_{w}_{h}.tif")
+            if not os.path.exists(dst) or os.path.getmtime(dst) < os.path.getmtime(p):
+                tmp = dst + ".tmp.tif"
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+                gdal.Translate(tmp, p, srcWin=[c0, r0, w, h],
+                               creationOptions=["TILED=YES",
+                                                f"BLOCKXSIZE={block}",
+                                                f"BLOCKYSIZE={block}",
+                                                "COMPRESS=DEFLATE",
+                                                f"PREDICTOR={3 if fp else 2}",
+                                                "BIGTIFF=IF_SAFER"])
+                cov = gdal.Open(tmp, gdal.GA_Update)
+                cov.BuildOverviews("AVERAGE", [2, 4, 8, 16])
+                cov = None
+                os.replace(tmp, dst)
+            out.append(dst)
+        print(f"[forest_change] COG-кэш: {len(out)} файл(ов), окно {w}x{h} "
+              f"({c0},{r0})", flush=True)
+        return out, None
+    except Exception as exc:
+        print(f"[forest_change] COG-кэш недоступен ({exc}); исходные файлы",
+              flush=True)
+        return files, aoi_bbox
+
+
+class FeatureStore:
+    """Persistent per-chip encoder features shared by mask and type stages.
+
+    Layout: (gh, gw, n_dates, 768) float32 + (gh, gw, n_dates) uint8 validity,
+    indexed in AOI-relative 32 px chips. A memmap keeps RAM bounded; only touched
+    tiles allocate pages.
+    """
+
+    VERSION = 2
+
+    def __init__(self, out_dir, labels, aoi, src_sig, band_idx, mode, enabled=True,
+                 model_sig=None, engine=None):
+        self.enabled = bool(enabled) and bool(labels) and aoi[2] > 0 and aoi[3] > 0
+        self.labels = [str(x) for x in labels]
+        self.index = {label: i for i, label in enumerate(self.labels)}
+        self.aoi = tuple(int(v) for v in aoi)
+        self.band_idx = list(band_idx) if band_idx else None
+        self.ndates = len(self.labels)
+        self.gw = max(1, int(np.ceil(self.aoi[2] / CHIP)))
+        self.gh = max(1, int(np.ceil(self.aoi[3] / CHIP)))
+        self.dtype = np.float16 if FEATURE_DTYPE in ("f16", "float16", "half") \
+            else np.float32
+        self.dtype_name = "f16" if self.dtype == np.float16 else "f32"
+        self.feat = None
+        self.valid = None
+        key = {
+            "v": self.VERSION, "mode": mode, "labels": self.labels,
+            "aoi": list(self.aoi), "band_idx": self.band_idx,
+            "chip": CHIP, "scale": SCALE, "boa": _BOA_ENV,
+            "dtype": str(np.dtype(self.dtype)), "src": src_sig,
+            "model": model_sig, "engine": engine,
+        }
+        self.key = hashlib.md5(
+            json.dumps(key, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        self.dir = (os.path.join(FEATURE_DIR, self.key[:16]) if FEATURE_DIR
+                    else os.path.join(out_dir, "features"))
+        if not self.enabled:
+            return
+        try:
+            os.makedirs(self.dir, exist_ok=True)
+            man_path = os.path.join(self.dir, "manifest.json")
+            feat_path = os.path.join(self.dir, f"features.{self.dtype_name}")
+            alt_path = os.path.join(self.dir, "features.f16" if self.dtype_name == "f32"
+                                    else "features.f32")
+            valid_path = os.path.join(self.dir, "valid.u8")
+            expected = self.gh * self.gw * self.ndates * 768 * np.dtype(self.dtype).itemsize
+            expected_valid = self.gh * self.gw * self.ndates
+            if FEATURE_MAX_MB > 0 and expected > FEATURE_MAX_MB * 1e6:
+                raise RuntimeError(
+                    f"нужно {expected / 1e6:.0f} МБ, лимит {FEATURE_MAX_MB:.0f} МБ")
+            if os.path.exists(man_path) and os.path.exists(feat_path) \
+                    and os.path.exists(valid_path):
+                try:
+                    with open(man_path, encoding="utf-8") as fh:
+                        man = json.load(fh)
+                except Exception:
+                    man = {}
+                if man.get("key") == self.key \
+                        and os.path.getsize(feat_path) == expected \
+                        and os.path.getsize(valid_path) == expected_valid:
+                    self.feat = np.memmap(feat_path, dtype=self.dtype, mode="r+",
+                                          shape=(self.gh, self.gw, self.ndates, 768))
+                    self.valid = np.memmap(valid_path, dtype=np.uint8, mode="r+",
+                                           shape=(self.gh, self.gw, self.ndates))
+                    return
+            for p in (feat_path, alt_path, valid_path):
+                if os.path.exists(p):
+                    os.remove(p)
+            self.feat = np.memmap(feat_path, dtype=self.dtype, mode="w+",
+                                  shape=(self.gh, self.gw, self.ndates, 768))
+            self.valid = np.memmap(valid_path, dtype=np.uint8, mode="w+",
+                                   shape=(self.gh, self.gw, self.ndates))
+            with open(man_path, "w", encoding="utf-8") as fh:
+                json.dump({"key": self.key, "version": self.VERSION,
+                           "labels": self.labels, "aoi": list(self.aoi),
+                           "band_idx": self.band_idx, "chip": CHIP,
+                           "dtype": str(np.dtype(self.dtype)),
+                           "shape": [self.gh, self.gw, self.ndates, 768],
+                           "src": src_sig}, fh, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            print(f"[forest_change] feature store отключён: {exc}", flush=True)
+            self.enabled = False
+            self.feat = None
+            self.valid = None
+
+    def date_index(self, label):
+        return self.index.get(str(label))
+
+    def write_tile(self, grid, valid, gx0, gy0, date_indices):
+        if not self.enabled or self.feat is None:
+            return
+        t_count = grid.shape[0]
+        nr, nc = grid.shape[1], grid.shape[2]
+        for t, di in enumerate(date_indices):
+            if t >= t_count or di is None:
+                continue
+            y1 = min(self.gh, gy0 + nr)
+            x1 = min(self.gw, gx0 + nc)
+            if y1 <= gy0 or x1 <= gx0:
+                continue
+            self.feat[gy0:y1, gx0:x1, di, :] = np.asarray(
+                grid[t, :y1 - gy0, :x1 - gx0], dtype=self.dtype)
+            self.valid[gy0:y1, gx0:x1, di] = np.asarray(
+                valid[t, :y1 - gy0, :x1 - gx0], dtype=np.uint8)
+
+    def read_coords(self, coords, di):
+        n = len(coords)
+        out = np.zeros((n, 768), np.float32)
+        have = np.zeros(n, bool)
+        if not self.enabled or self.feat is None or di is None:
+            return out, have
+        for k, (gy, gx) in enumerate(coords):
+            if 0 <= gy < self.gh and 0 <= gx < self.gw and self.valid[gy, gx, di]:
+                out[k] = self.feat[gy, gx, di, :]
+                have[k] = True
+        return out, have
+
+    def write_coords(self, coords, di, feats):
+        if not self.enabled or self.feat is None or di is None:
+            return
+        feats = np.asarray(feats, dtype=self.dtype)
+        for k, (gy, gx) in enumerate(coords):
+            if 0 <= gy < self.gh and 0 <= gx < self.gw:
+                self.feat[gy, gx, di, :] = feats[k]
+                self.valid[gy, gx, di] = 1
+
+    def flush(self):
+        for arr in (self.feat, self.valid):
+            if arr is not None:
+                try:
+                    arr.flush()
+                except Exception:
+                    pass
+
+    def close(self):
+        self.flush()
+        self.feat = None
+        self.valid = None
+
+    def info(self):
+        return {"enabled": bool(self.enabled), "dir": self.dir if self.enabled else None,
+                "shape": [self.gh, self.gw, self.ndates, 768] if self.enabled else None,
+                "dtype": self.dtype_name if self.enabled else None,
+                "dates": self.labels if self.enabled else []}
+
+
+def _feature_store(out_dir, mode, s, labels, band_idx, enabled=None, model_paths=None,
+                   engine=None):
+    model_sig = []
+    for p in (model_paths or []):
+        if p and os.path.exists(p):
+            model_sig.append([os.path.abspath(p), os.path.getmtime(p)])
+    return FeatureStore(out_dir, labels, (s["c0"], s["r0"], s["w"], s["h"]),
+                        _source_sig(mode, s, labels), band_idx, mode,
+                        FEATURE_STORE if enabled is None else enabled,
+                        model_sig=model_sig, engine=engine)
 
 
 _VRT_CACHE = {}
@@ -519,7 +809,8 @@ class MaskCtxModel:
         import onnxruntime as ort
         with open(path, "rb") as fh:
             buf = fh.read()
-        self.sess = ort.InferenceSession(buf, providers=["CPUExecutionProvider"])
+        self.sess = ort.InferenceSession(buf, _ort_options(),
+                                         providers=["CPUExecutionProvider"])
 
     @property
     def provider(self):
@@ -527,32 +818,107 @@ class MaskCtxModel:
 
     def run(self, feats, ctx, valid, dt, doy):
         """feats (M,T,768), ctx (M,T,3,3,768), valid (M,T,3,3) -> (M,2)."""
-        return self.sess.run(None, {"feats": feats.astype(np.float32),
-                                    "ctx": ctx.astype(np.float32),
+        return self.sess.run(None, {"feats": np.ascontiguousarray(feats, np.float32),
+                                    "ctx": np.ascontiguousarray(ctx, np.float32),
                                     "valid": np.asarray(valid, dtype=bool),
-                                    "dt": dt.astype(np.float32),
-                                    "doy": doy.astype(np.float32)})[0]
+                                    "dt": np.ascontiguousarray(dt, np.float32),
+                                    "doy": np.ascontiguousarray(doy, np.float32)})[0]
+
+
+class OpenVINOEncoder:
+    """Encoder on the OpenVINO CPU plugin (f32 default, bf16/int8 optional)."""
+
+    def __init__(self, path, precision=None):
+        import openvino as ov
+        self.precision = (precision or OV_PRECISION or "f32").lower()
+        self.core = ov.Core()
+        model = self.core.read_model(path)
+        model.reshape({"vol": [OV_BATCH, 6, CHIP, CHIP]})
+        cfg = {"INFERENCE_NUM_THREADS": THREADS, "NUM_STREAMS": 1,
+               "PERFORMANCE_HINT": "THROUGHPUT"}
+        if self.precision != "int8":
+            cfg["INFERENCE_PRECISION_HINT"] = self.precision
+        self.cm = self.core.compile_model(model, "CPU", cfg)
+        self._provider = f"OpenVINO-CPU-{self.precision}"
+        try:
+            self._actual = str(self.cm.get_property("INFERENCE_PRECISION_HINT"))
+        except Exception:
+            self._actual = "?"
+
+    @property
+    def provider(self):
+        return self._provider
+
+    def run(self, chips):
+        chips = np.ascontiguousarray(chips, dtype=np.float32)
+        n = len(chips)
+        if n == 0:
+            return np.empty((0, 768), np.float32)
+        out = []
+        for i0 in range(0, n, OV_BATCH):
+            chunk = chips[i0:i0 + OV_BATCH]
+            k = len(chunk)
+            if k < OV_BATCH:
+                pad = np.zeros((OV_BATCH - k, 6, CHIP, CHIP), np.float32)
+                chunk = np.concatenate([chunk, pad], 0)
+            y = np.asarray(list(self.cm({"vol": chunk}).values())[0],
+                           dtype=np.float32)
+            out.append(y[:k])
+        return out[0] if len(out) == 1 else np.concatenate(out, 0)
 
 
 class EncoderModel:
     """Channel-agnostic CNN encoder (12 layers x 768, ONNX): chips -> per-date features."""
 
     def __init__(self, path, provider="cpu"):
+        self._ov = None
+        self.sess = None
+        orig_path = path
+        pref = str(provider or "auto").lower()
+        ov_precision = None
+        ov_path = path
+        if pref in ("openvino-int8", "ov-int8"):
+            ov_path = os.path.join(os.path.dirname(path),
+                                   "typenet_encoder_int8_ov.xml")
+            ov_precision = "int8"
+            pref = "openvino"
+        elif pref in ("openvino-bf16", "ov-bf16"):
+            ov_precision = "bf16"
+            pref = "openvino"
+        if pref in ("auto", "openvino", "ov", "cpu-openvino"):
+            try:
+                self._ov = OpenVINOEncoder(ov_path, precision=ov_precision)
+                return
+            except Exception as exc:
+                print(f"[forest_change] OpenVINO недоступен ({exc}); ONNX Runtime",
+                      flush=True)
         import onnxruntime as ort
-        with open(path, "rb") as fh:
+        with open(orig_path, "rb") as fh:
             buf = fh.read()
         try:
-            self.sess = ort.InferenceSession(buf, providers=pick_providers(provider))
+            self.sess = ort.InferenceSession(buf, _ort_options(),
+                                             providers=pick_providers(provider))
         except Exception:
-            self.sess = ort.InferenceSession(buf, providers=["CPUExecutionProvider"])
+            self.sess = ort.InferenceSession(buf, _ort_options(),
+                                             providers=["CPUExecutionProvider"])
 
     @property
     def provider(self):
+        if self._ov is not None:
+            return self._ov.provider
         return self.sess.get_providers()[0]
 
     def run(self, chips):
         """chips (M,6,32,32) raw reflectance -> (M,768)."""
-        return self.sess.run(None, {"vol": chips.astype(np.float32)})[0]
+        if self._ov is not None:
+            return self._ov.run(chips)
+        chips = np.ascontiguousarray(chips, dtype=np.float32)
+        if len(chips) == 0:
+            return np.empty((0, 768), np.float32)
+        out = []
+        for i0 in range(0, len(chips), RUN_BATCH):
+            out.append(self.sess.run(None, {"vol": chips[i0:i0 + RUN_BATCH]})[0])
+        return out[0] if len(out) == 1 else np.concatenate(out, 0)
 
 
 class TypeCfCModel:
@@ -565,7 +931,8 @@ class TypeCfCModel:
         import onnxruntime as ort
         with open(path, "rb") as fh:
             buf = fh.read()
-        self.sess = ort.InferenceSession(buf, providers=["CPUExecutionProvider"])
+        self.sess = ort.InferenceSession(buf, _ort_options(),
+                                         providers=["CPUExecutionProvider"])
         self.has_ctx = any(i.name == "ctx" for i in self.sess.get_inputs())
         self.has_tex = any(i.name == "tex" for i in self.sess.get_inputs())
         self.has_spec = any(i.name == "spec" for i in self.sess.get_inputs())
@@ -575,16 +942,16 @@ class TypeCfCModel:
         return self.sess.get_providers()[0]
 
     def run(self, feats, ctx, valid, dt, doy, tex, spec):
-        feed = {"feats": feats.astype(np.float32),
-                "dt": dt.astype(np.float32),
-                "doy": doy.astype(np.float32)}
+        feed = {"feats": np.ascontiguousarray(feats, np.float32),
+                "dt": np.ascontiguousarray(dt, np.float32),
+                "doy": np.ascontiguousarray(doy, np.float32)}
         if self.has_ctx:
-            feed["ctx"] = ctx.astype(np.float32)
+            feed["ctx"] = np.ascontiguousarray(ctx, np.float32)
             feed["valid"] = np.asarray(valid, dtype=bool)
         if self.has_tex:
-            feed["tex"] = tex.astype(np.float32)
+            feed["tex"] = np.ascontiguousarray(tex, np.float32)
         if self.has_spec:
-            feed["spec"] = spec.astype(np.float32)
+            feed["spec"] = np.ascontiguousarray(spec, np.float32)
         return self.sess.run(None, feed)[0]
 
 
@@ -602,10 +969,15 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
     _BOA_MODE.clear()
     _BOA_AMBIG.clear()
     os.makedirs(out_dir, exist_ok=True)
-    s = _setup(mode, period, mosaic_dir, files, t1_path, t2_path, aoi_bbox)
+    raw_files = list(files or []) or ([t1_path, t2_path]
+                                     if t1_path and t2_path else [])
     if mode != "period":
-        s["series_files"] = list(files or []) or ([t1_path, t2_path] if t1_path else [])
+        raw_files, aoi_bbox = _cog_inputs(raw_files, aoi_bbox, out_dir)
+    s = _setup(mode, period, mosaic_dir, raw_files, None, None, aoi_bbox)
+    if mode != "period":
+        s["series_files"] = list(raw_files)
     labels, dt_all, kind, paths = _series_for(s, mode, dates)
+    labels_all = list(labels)
     warn = _series_warning(labels, dt_all, mode)
     sel = _select_dates(len(labels), cap=MASK_CTX_T, keep_intermediate=use_intermediate)
     labels = [labels[i] for i in sel]
@@ -620,6 +992,10 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
     enc_path = os.path.join(os.path.dirname(mask_model), "typenet_encoder.onnx")
     if not os.path.exists(enc_path):
         raise ValueError(f"DOFA-СЌРЅРєРѕРґРµСЂ РЅРµ РЅР°Р№РґРµРЅ СЂСЏРґРѕРј СЃ РјР°СЃРєРѕР№: {enc_path}")
+    store = _feature_store(out_dir, mode, s, labels_all, band_idx,
+                           model_paths=[enc_path],
+                           engine=f"{provider}:{OV_PRECISION}")
+    date_indices = [store.date_index(l) for l in labels]
     src_sig = []
     if mode == "period":
         for l in labels:
@@ -653,6 +1029,7 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
                 summary["cached"] = True
                 print(f"[forest_change] РјР°СЃРєР°: РєСЌС€ ({summary.get('changed_ha', 0):.1f} РіР°) вЂ” "
                       f"РїСЂРѕРїСѓСЃРєР°СЋ СЂР°СЃС‡С‘С‚", flush=True)
+                store.close()
                 return summary
         except Exception:
             pass
@@ -674,10 +1051,12 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
     def flush():
         for feats, ctx, cval, dtb, doyb, pos in buf:
             n = len(feats)
-            for i0 in range(0, n, 512):
-                logits = model.run(feats[i0:i0 + 512], ctx[i0:i0 + 512],
-                                   cval[i0:i0 + 512], dtb[i0:i0 + 512],
-                                   doyb[i0:i0 + 512])
+            for i0 in range(0, n, MASK_BATCH):
+                logits = model.run(feats[i0:i0 + MASK_BATCH],
+                                   ctx[i0:i0 + MASK_BATCH],
+                                   cval[i0:i0 + MASK_BATCH],
+                                   dtb[i0:i0 + MASK_BATCH],
+                                   doyb[i0:i0 + MASK_BATCH])
                 logits = np.asarray(logits, dtype=np.float32).reshape(-1)
                 probs = 1.0 / (1.0 + np.exp(-logits))
                 for j in range(probs.shape[0]):
@@ -721,8 +1100,8 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
             chips = np.ascontiguousarray(chips).reshape(nr * nc, 6, CHIP, CHIP)
             gvalid[li] = (chips.sum(axis=(1, 2, 3)) > 0).reshape(nr, nc)
             f = np.empty((nr * nc, 768), np.float32)
-            for i0 in range(0, nr * nc, 512):
-                f[i0:i0 + 512] = enc.run(chips[i0:i0 + 512])
+            for i0 in range(0, nr * nc, RUN_BATCH):
+                f[i0:i0 + RUN_BATCH] = enc.run(chips[i0:i0 + RUN_BATCH])
             grid[li] = f.reshape(nr, nc, 768)
         first_i = series[0][:, oy:oy + th, ox:ox + tw]
         last_i = series[-1][:, oy:oy + th, ox:ox + tw]
@@ -731,6 +1110,12 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
             invalid |= (_ndvi(first_i) < FOREST_NDVI_MIN) & (_ndvi(last_i) < FOREST_NDVI_MIN)
         cells_changed.clear()
         nh, nw = th // CHIP, tw // CHIP
+        if store.enabled and nh and nw:
+            gy0, gx0 = y // CHIP, x // CHIP
+            store.write_tile(
+                grid[:, oy // CHIP:oy // CHIP + nh, ox // CHIP:ox // CHIP + nw, :],
+                gvalid[:, oy // CHIP:oy // CHIP + nh, ox // CHIP:ox // CHIP + nw],
+                gx0, gy0, date_indices)
         if nh and nw:
             inv_frac = invalid[:nh * CHIP, :nw * CHIP].reshape(
                 nh, CHIP, nw, CHIP).mean(axis=(1, 3))
@@ -791,7 +1176,9 @@ def compute_mask(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_pat
                "tile_px": TILE_PX, "tiles": len(tiles),
                "changed_chips": changed_chips, "changed_px": changed_chips * CHIP * CHIP,
                "invalid_px": invalid_px,
-               "changed_ha": float(changed_chips * CHIP * CHIP * px_area), "mask_tif": path}
+               "changed_ha": float(changed_chips * CHIP * CHIP * px_area), "mask_tif": path,
+               "feature_store": store.info()}
+    store.close()
     with open(os.path.join(out_dir, "mask_summary.json"), "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2, ensure_ascii=False)
     with open(cache_file, "w", encoding="utf-8") as fh:
@@ -836,51 +1223,120 @@ def _mask_windows(change, chip=CHIP, block=BLOCK):
             yield r0, c0, r1, c1
 
 
-class CfcUNetModel:
-    """CfC U-Net pixel mask (ONNX, CPU): (M,T,9,32,32) -> (M,32,32) logits."""
-
+class OpenVINOCfcUNet:
     def __init__(self, path):
+        import openvino as ov
+        self.core = ov.Core()
+        model = self.core.read_model(path)
+        self.cm = self.core.compile_model(
+            model, "CPU", {"INFERENCE_NUM_THREADS": THREADS,
+                           "NUM_STREAMS": 1,
+                           "INFERENCE_PRECISION_HINT": OV_PRECISION})
+        self._provider = f"OpenVINO-CPU-{OV_PRECISION}"
+
+    @property
+    def provider(self):
+        return self._provider
+
+    def run(self, x, dt, lengths):
+        out = self.cm({"x": np.ascontiguousarray(x, np.float32),
+                       "dt": np.ascontiguousarray(dt, np.float32),
+                       "lengths": np.ascontiguousarray(lengths, np.int64)})
+        return np.asarray(list(out.values())[0], dtype=np.float32)
+
+
+class CfcUNetModel:
+    """CfC U-Net pixel mask: (M,T,9,32,32) -> (M,32,32) logits."""
+
+    def __init__(self, path, provider="auto"):
+        self._ov = None
+        self.sess = None
+        if str(provider or "auto").lower() in ("openvino", "ov", "cpu-openvino",
+                                               "openvino-bf16", "openvino-int8"):
+            try:
+                self._ov = OpenVINOCfcUNet(path)
+                return
+            except Exception as exc:
+                print(f"[forest_change] U-Net OpenVINO недоступен ({exc}); ORT",
+                      flush=True)
         import onnxruntime as ort
         with open(path, "rb") as fh:
             buf = fh.read()
-        self.sess = ort.InferenceSession(buf, providers=["CPUExecutionProvider"])
+        self.sess = ort.InferenceSession(buf, _ort_options(),
+                                         providers=["CPUExecutionProvider"])
+
+    @property
+    def provider(self):
+        if self._ov is not None:
+            return self._ov.provider
+        return self.sess.get_providers()[0]
 
     def run(self, x, dt, lengths):
-        return self.sess.run(None, {"x": x.astype(np.float32),
-                                    "dt": dt.astype(np.float32),
-                                    "lengths": lengths.astype(np.int64)})[0]
+        if self._ov is not None:
+            return self._ov.run(x, dt, lengths)
+        return self.sess.run(None, {"x": np.ascontiguousarray(x, np.float32),
+                                    "dt": np.ascontiguousarray(dt, np.float32),
+                                    "lengths": np.ascontiguousarray(lengths, np.int64)})[0]
 
 
 def _remove_small(mask, min_px):
-    """8-connected component filter on a 2D bool mask."""
+    """Exact 8-connected component filter via run-length union-find."""
+    mask = np.asarray(mask, bool)
+    if min_px <= 1 or not mask.any():
+        return mask
     h, w = mask.shape
-    seen = np.zeros((h, w), bool)
-    out = np.zeros((h, w), bool)
-    for sy in range(h):
-        for sx in range(w):
-            if not mask[sy, sx] or seen[sy, sx]:
+    parent, size = [], []
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        a, b = find(a), find(b)
+        if a == b:
+            return
+        if size[a] < size[b]:
+            a, b = b, a
+        parent[b] = a
+        size[a] += size[b]
+
+    rows = []
+    prev = []
+    for y in range(h):
+        row = mask[y]
+        cur = []
+        x = 0
+        while x < w:
+            if not row[x]:
+                x += 1
                 continue
-            stack = [(sy, sx)]
-            seen[sy, sx] = True
-            comp = []
-            while stack:
-                y, x = stack.pop()
-                comp.append((y, x))
-                for dy in (-1, 0, 1):
-                    for dx in (-1, 0, 1):
-                        ny, nx = y + dy, x + dx
-                        if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
-                            seen[ny, nx] = True
-                            stack.append((ny, nx))
-            if len(comp) >= min_px:
-                for y, x in comp:
-                    out[y, x] = True
+            x0 = x
+            while x < w and row[x]:
+                x += 1
+            lab = len(parent)
+            parent.append(lab)
+            size.append(x - x0)
+            cur.append((x0, x - 1, lab))
+        for x0, x1, lab in cur:
+            for px0, px1, plab in prev:
+                if x0 <= px1 + 1 and px0 <= x1 + 1:
+                    union(lab, plab)
+        rows.append(cur)
+        prev = cur
+    out = np.zeros((h, w), bool)
+    for y, cur in enumerate(rows):
+        for x0, x1, lab in cur:
+            if size[find(lab)] >= min_px:
+                out[y, x0:x1 + 1] = True
     return out
 
 
 def compute_disturbance(mode, out_dir, period=None, mosaic_dir=None, files=None, t1_path=None,
                         t2_path=None, band_idx=None, aoi_bbox=None, progress=None,
-                        mask_path=None, preset="standard", unet_model=None):
+                        mask_path=None, preset="standard", unet_model=None,
+                        provider="auto"):
     """Pixel-level disturbance mask: CfC U-Net inside the model-changed chips.
 
     The U-Net consumes all selected dates (T, 9 features: 6 bands + NDVI/NBR/NDMI)
@@ -890,9 +1346,13 @@ def compute_disturbance(mode, out_dir, period=None, mosaic_dir=None, files=None,
     _BOA_MODE.clear()
     _BOA_AMBIG.clear()
     os.makedirs(out_dir, exist_ok=True)
-    s = _setup(mode, period, mosaic_dir, files, t1_path, t2_path, aoi_bbox)
+    raw_files = list(files or []) or ([t1_path, t2_path]
+                                     if t1_path and t2_path else [])
     if mode != "period":
-        s["series_files"] = list(files or []) or ([t1_path, t2_path] if t1_path else [])
+        raw_files, aoi_bbox = _cog_inputs(raw_files, aoi_bbox, out_dir)
+    s = _setup(mode, period, mosaic_dir, raw_files, None, None, aoi_bbox)
+    if mode != "period":
+        s["series_files"] = list(raw_files)
     labels, dt_all, _kind, _paths = _series_for(s, mode, None)
     if len(labels) < 2:
         raise ValueError("Для пиксельной маски нужно минимум 2 даты")
@@ -901,7 +1361,7 @@ def compute_disturbance(mode, out_dir, period=None, mosaic_dir=None, files=None,
         raise ValueError(f"Маска не найдена: {mask_file}")
     unet_path = unet_model or os.path.join(os.path.dirname(os.path.abspath(__file__)), "model", "cfc_unet_p3.onnx")
     use_unet = os.path.exists(unet_path)
-    unet = CfcUNetModel(unet_path) if use_unet else None
+    unet = CfcUNetModel(unet_path, provider) if use_unet else None
     T = len(labels)
     dt_sel = np.zeros(T, np.float32)
     for k in range(1, T):
@@ -915,33 +1375,45 @@ def compute_disturbance(mode, out_dir, period=None, mosaic_dir=None, files=None,
     tiles = _tiles(s["w"], s["h"])
     dist_px = chip_px = 0
     for ti, (x, y, tw, th) in enumerate(tiles):
-        reads = []
-        for label in labels:
-            b, scl = _series_read(mode, s, band_idx, label, s["c0"] + x, s["r0"] + y, tw, th)
-            reads.append(b)
         m = _read_band1(mask_file, mask_dx + x, mask_dy + y, tw, th)
         changed = m == 1
         out = np.full((th, tw), 255, np.uint8)
         chip_px += int(changed.sum())
+        if not changed.any():
+            band.WriteArray(out, x, y)
+            if progress:
+                progress(int(100 * (ti + 1) / len(tiles)))
+            continue
+        reads = []
+        for label in labels:
+            b, _scl = _series_read(mode, s, band_idx, label,
+                                   s["c0"] + x, s["r0"] + y, tw, th)
+            reads.append(b)
         if use_unet:
             nh, nw = th // CHIP, tw // CHIP
             if nh and nw:
                 sel = np.argwhere(changed[:nh * CHIP, :nw * CHIP].reshape(
                     nh, CHIP, nw, CHIP).any(axis=(1, 3)))
                 if len(sel):
-                    xb = np.empty((len(sel), T, 9, CHIP, CHIP), np.float32)
-                    for t in range(T):
-                        for k, (i, j) in enumerate(sel):
-                            xb[k, t] = _features9(
-                                reads[t][:, i * CHIP:(i + 1) * CHIP, j * CHIP:(j + 1) * CHIP])
-                    p = unet.run(xb, np.tile(dt_sel, (len(sel), 1)),
-                                 np.full(len(sel), T, np.int64))
-                    p = 1.0 / (1.0 + np.exp(-np.asarray(p, np.float32)))
-                    for k, (i, j) in enumerate(sel):
-                        pred = _remove_small(p[k] > UNET_THR, UNET_MIN_PX)
-                        rr, cc = i * CHIP, j * CHIP
-                        out[rr:rr + CHIP, cc:cc + CHIP] = pred.astype(np.uint8)
-                        dist_px += int(pred.sum())
+                    feats9 = [_features9(reads[t]) for t in range(T)]
+                    for b0 in range(0, len(sel), CFC_BATCH):
+                        b1 = min(len(sel), b0 + CFC_BATCH)
+                        part = sel[b0:b1]
+                        m = len(part)
+                        xb = np.empty((m, T, 9, CHIP, CHIP), np.float32)
+                        for t in range(T):
+                            for k, (i, j) in enumerate(part):
+                                xb[k, t] = feats9[t][
+                                    :, i * CHIP:(i + 1) * CHIP,
+                                    j * CHIP:(j + 1) * CHIP]
+                        p = unet.run(xb, np.tile(dt_sel, (m, 1)),
+                                     np.full(m, T, np.int64))
+                        p = 1.0 / (1.0 + np.exp(-np.asarray(p, np.float32)))
+                        for k, (i, j) in enumerate(part):
+                            pred = _remove_small(p[k] > UNET_THR, UNET_MIN_PX)
+                            rr, cc = i * CHIP, j * CHIP
+                            out[rr:rr + CHIP, cc:cc + CHIP] = pred.astype(np.uint8)
+                            dist_px += int(pred.sum())
         else:
             b1 = reads[0].astype(np.float32) / SCALE
             b2 = reads[-1].astype(np.float32) / SCALE
@@ -963,6 +1435,7 @@ def compute_disturbance(mode, out_dir, period=None, mosaic_dir=None, files=None,
                "preset": preset,
                "unet_thr": float(UNET_THR) if use_unet else None,
                "unet_min_px": int(UNET_MIN_PX) if use_unet else None,
+               "unet_provider": unet.provider if unet is not None else None,
                "dates": labels,
                "disturbance_px": dist_px, "disturbance_ha": dist_px * 0.01,
                "chip_ha": chip_px * 0.01,
@@ -981,9 +1454,13 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
     _BOA_MODE.clear()
     _BOA_AMBIG.clear()
     os.makedirs(out_dir, exist_ok=True)
-    s = _setup(mode, period, mosaic_dir, files, t1_path, t2_path, aoi_bbox)
+    raw_files = list(files or []) or ([t1_path, t2_path]
+                                     if t1_path and t2_path else [])
     if mode != "period":
-        s["series_files"] = list(files or []) or ([t1_path, t2_path] if t1_path else [])
+        raw_files, aoi_bbox = _cog_inputs(raw_files, aoi_bbox, out_dir)
+    s = _setup(mode, period, mosaic_dir, raw_files, None, None, aoi_bbox)
+    if mode != "period":
+        s["series_files"] = list(raw_files)
     gt, proj, c0, r0, w, h = s["gt"], s["proj"], s["c0"], s["r0"], s["w"], s["h"]
     cls_path = os.path.join(out_dir, "classes.tif")
     ds_out = _create_raster(cls_path, gt, c0, r0, w, h, proj)
@@ -1002,6 +1479,7 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
     if not os.path.exists(enc_path):
         raise ValueError(f"Р­РЅРєРѕРґРµСЂ С‚РёРїРѕРІ РЅРµ РЅР°Р№РґРµРЅ СЂСЏРґРѕРј СЃ РјРѕРґРµР»СЊСЋ: {enc_path}")
     labels, dt_all, kind, paths = _series_for(s, mode, None)
+    labels_all = list(labels)
     warn = _series_warning(labels, dt_all, mode)
     sel = _select_dates(len(labels), keep_intermediate=use_intermediate)
     labels = [labels[i] for i in sel]
@@ -1011,117 +1489,99 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
     doy_sel = np.stack([_doy3(l, year=(kind != "mosaic")) for l in labels])
     enc = EncoderModel(enc_path, provider)
     cfc = TypeCfCModel(model_path, provider)
-    _sig_src = (os.path.join(mosaic_dir, f"{labels[0]}_B04.tif") if mode == "period"
-                else (paths[0] if paths else ""))
-    _sig = os.path.getmtime(_sig_src) if _sig_src and os.path.exists(_sig_src) else 0
-    cache_key = hashlib.md5(
-        (os.path.abspath(model_path) + "|" + str(os.path.getmtime(model_path)) + "|" +
-         os.path.abspath(enc_path) + "|" + str(os.path.getmtime(enc_path)) + "|" +
-         str(_sig) + "|" + ",".join(map(str, labels))).encode()).hexdigest()[:16]
-    cache_dir = os.path.join(out_dir, "cache")
-    cache_path = os.path.join(cache_dir, f"type_feats_{cache_key}.npz")
-    fcache = {}
-    if os.path.exists(cache_path):
-        _zc = np.load(cache_path)
-        _zf = _zc["feats"][:]
-        _zk = _zc["keys"][:]
-        fcache = {(int(a), int(b)): _zf[i] for i, (a, b) in enumerate(_zk)}
-        print(f"[forest_change] РєСЌС€ С„РёС‡ С‚РёРїРѕРІ: {len(fcache)} С‡РёРїРѕРІ "
-              f"({os.path.basename(cache_path)})", flush=True)
+    store = _feature_store(out_dir, mode, s, labels_all, band_idx,
+                           model_paths=[enc_path],
+                           engine=f"{provider}:{OV_PRECISION}")
+    date_indices = [store.date_index(l) for l in labels]
     print(f"[forest_change] С‚РёРїС‹: TypeNet (СЌРЅРєРѕРґРµСЂ {os.path.basename(enc_path)} + "
           f"cross-attention readout {os.path.basename(model_path)}, РґРёРЅР°РјРёС‡РµСЃРєРѕРµ T, "
-          f"readout РЅР° CPU{', texture 9' if cfc.has_spec else ''}), {len(labels)} РґР°С‚",
-          flush=True)
+          f"readout РЅР° CPU{', texture 9' if cfc.has_spec else ''}), {len(labels)} РґР°С‚, "
+          f"feature store {'on' if store.enabled else 'off'}", flush=True)
     cells = []
     tiles = _tiles(w, h)
     if progress:
         progress(1)
-    pend = []
-    pend_n = [0]
-
-    def flush():
-        if not pend:
-            return
-        chips = pend[0][0] if len(pend) == 1 else np.concatenate([p[0] for p in pend], 0)
-        ctxc = pend[0][1] if len(pend) == 1 else np.concatenate([p[1] for p in pend], 0)
-        dtb = pend[0][2] if len(pend) == 1 else np.concatenate([p[2] for p in pend], 0)
-        doyb = pend[0][3] if len(pend) == 1 else np.concatenate([p[3] for p in pend], 0)
-        pos = [q for p in pend for q in p[4]]
-        M, D = chips.shape[0], chips.shape[1]
-        keys = [(int(r0 + rr), int(c0 + cc)) for (rr, cc) in pos]
-        feats = np.empty((M, D, 768), np.float32)
-        miss = [i for i, k_ in enumerate(keys) if k_ not in fcache]
-        if miss:
-            flat = chips[miss].reshape(len(miss) * D, 6, CHIP, CHIP)
-            mf = np.empty((len(miss) * D, 768), np.float32)
-            for i0 in range(0, len(miss) * D, 512):
-                mf[i0:i0 + 512] = enc.run(flat[i0:i0 + 512])
-            mf = mf.reshape(len(miss), D, 768)
-            for j, mi in enumerate(miss):
-                feats[mi] = mf[j]
-                fcache[keys[mi]] = mf[j].astype(np.float16)
-        for i, k_ in enumerate(keys):
-            if k_ not in miss and i not in miss:
-                feats[i] = fcache[k_]
-        C = ctxc.shape[1]
-        cf = np.empty((M, C, D, 768), np.float32)
-        flatc = ctxc.reshape(M * C * D, 6, CHIP, CHIP)
-        for i0 in range(0, M * C * D, 512):
-            cf.reshape(-1, 768)[i0:i0 + 512] = enc.run(flatc[i0:i0 + 512])
-        ctx = cf.reshape(M, 3, 3, D, 768).transpose(0, 3, 1, 2, 4)
-        valid = np.ones((M, D, 3, 3), np.float32)
-        texb = np.empty((M, D, 9), np.float32)
-        specb = np.empty((M, D, 9), np.float32)
-        for i in range(M):
-            for d in range(D):
-                texb[i, d] = _texture9(np.clip(chips[i, d], 0.0, 1.5))
-                specb[i, d] = _features9(chips[i, d] * SCALE).mean(axis=(1, 2))
-        for i0 in range(0, M, 512):
-            logits = cfc.run(feats[i0:i0 + 512], ctx[i0:i0 + 512],
-                             valid[i0:i0 + 512], dtb[i0:i0 + 512],
-                             doyb[i0:i0 + 512], texb[i0:i0 + 512],
-                             specb[i0:i0 + 512])
-            logits = np.asarray(logits, dtype=np.float32) + TYPE_BIAS
-            probs = _softmax(logits)
-            for j in range(logits.shape[0]):
-                k = int(logits[j].argmax()) + 1       # 0/1/2 -> logging/windfall/fire
-                rr, cc = pos[i0 + j]
-                cells.append((rr, cc, k, float(probs[j, k - 1])))
-        pend.clear(); pend_n[0] = 0
 
     def process_window(ax, ay, series, change):
-        """Classify the changed chips of one read sub-window (series = per-date (6,h,w))."""
+        """Classify changed chips; reuse/encode each needed chip feature once."""
         D = len(series)
         th_sub, tw_sub = change.shape
         nh, nw = th_sub // CHIP, tw_sub // CHIP
         if nh == 0 or nw == 0:
             return
-        frac = change[:nh * CHIP, :nw * CHIP].reshape(nh, CHIP, nw, CHIP).mean(axis=(1, 3))
+        frac = change[:nh * CHIP, :nw * CHIP].reshape(
+            nh, CHIP, nw, CHIP).mean(axis=(1, 3))
         sel = np.argwhere(frac >= CHANGE_FRAC)
         if len(sel) == 0:
             return
-        chips = np.empty((len(sel), D, 6, CHIP, CHIP), np.float32)
-        ctxc = np.empty((len(sel), 9, D, 6, CHIP, CHIP), np.float32)
-        for li in range(D):
-            b = series[li][:, :nh * CHIP, :nw * CHIP].astype(np.float32) / SCALE
-            arr = b.reshape(6, nh, CHIP, nw, CHIP).transpose(1, 3, 0, 2, 4)
-            chips[:, li] = arr[sel[:, 0], sel[:, 1]]
-        for n, (i, j) in enumerate(sel):
+        needed = set()
+        for i, j in sel:
+            i, j = int(i), int(j)
             for dj in (-1, 0, 1):
                 for di in (-1, 0, 1):
-                    ii = min(max(int(i) + dj, 0), nh - 1)
-                    jj = min(max(int(j) + di, 0), nw - 1)
-                    k = (dj + 1) * 3 + (di + 1)
-                    for li in range(D):
-                        ctxc[n, k, li] = series[li][
-                            :, ii * CHIP:(ii + 1) * CHIP,
-                            jj * CHIP:(jj + 1) * CHIP].astype(np.float32) / SCALE
-        pend.append((chips, ctxc, np.tile(dt_sel, (len(sel), 1)),
-                     np.tile(doy_sel, (len(sel), 1, 1)),
-                     [(ay + int(j) * CHIP, ax + int(i) * CHIP) for j, i in sel]))
-        pend_n[0] += len(sel)
-        if pend_n[0] >= 16:
-            flush()
+                    needed.add((min(max(i + dj, 0), nh - 1),
+                                min(max(j + di, 0), nw - 1)))
+        coords = sorted(needed)
+        cindex = {c: k for k, c in enumerate(coords)}
+        gx0, gy0 = ax // CHIP, ay // CHIP
+        store_coords = [(gy0 + i, gx0 + j) for i, j in coords]
+        K = len(coords)
+        feat = np.empty((K, D, 768), np.float32)
+        have = np.zeros((K, D), bool)
+        for d, di in enumerate(date_indices):
+            if store.enabled and di is not None:
+                vals, avail = store.read_coords(store_coords, di)
+                feat[avail, d] = vals[avail]
+                have[avail, d] = True
+        for d, di in enumerate(date_indices):
+            miss = np.where(~have[:, d])[0]
+            if len(miss) == 0:
+                continue
+            raw = np.empty((len(miss), 6, CHIP, CHIP), np.float32)
+            for q, k in enumerate(miss):
+                i, j = coords[k]
+                raw[q] = series[d][:, i * CHIP:(i + 1) * CHIP,
+                                   j * CHIP:(j + 1) * CHIP].astype(np.float32) / SCALE
+            vals = enc.run(raw)
+            feat[miss, d] = vals
+            have[miss, d] = True
+            if store.enabled and di is not None:
+                store.write_coords([store_coords[k] for k in miss], di, vals)
+        M = len(sel)
+        feats = np.empty((M, D, 768), np.float32)
+        ctx = np.empty((M, D, 3, 3, 768), np.float32)
+        tex = np.empty((M, D, 9), np.float32)
+        spec = np.empty((M, D, 9), np.float32)
+        for n, (i, j) in enumerate(sel):
+            i, j = int(i), int(j)
+            for d in range(D):
+                feats[n, d] = feat[cindex[(i, j)], d]
+                raw = series[d][:, i * CHIP:(i + 1) * CHIP,
+                                j * CHIP:(j + 1) * CHIP].astype(np.float32)
+                ref = raw / SCALE
+                tex[n, d] = _texture9(np.clip(ref, 0.0, 1.5))
+                spec[n, d] = _features9(raw).mean(axis=(1, 2))
+                for dj in (-1, 0, 1):
+                    for di in (-1, 0, 1):
+                        ii = min(max(i + dj, 0), nh - 1)
+                        jj = min(max(j + di, 0), nw - 1)
+                        ctx[n, d, dj + 1, di + 1] = feat[cindex[(ii, jj)], d]
+        for b0 in range(0, M, CFC_BATCH):
+            b1 = min(M, b0 + CFC_BATCH)
+            m = b1 - b0
+            logits = cfc.run(feats[b0:b1], ctx[b0:b1],
+                             np.ones((m, D, 3, 3), np.float32),
+                             np.tile(dt_sel, (m, 1)),
+                             np.tile(doy_sel, (m, 1, 1)),
+                             tex[b0:b1], spec[b0:b1])
+            logits = np.asarray(logits, dtype=np.float32) + TYPE_BIAS
+            probs = _softmax(logits)
+            for q in range(m):
+                k = int(logits[q].argmax()) + 1
+                i, j = sel[b0 + q]
+                rr = ay + int(i) * CHIP
+                cc = ax + int(j) * CHIP
+                cells.append((rr, cc, k, float(probs[q, k - 1])))
 
     ex = ThreadPoolExecutor(max_workers=1)
 
@@ -1169,7 +1629,6 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
             B = series[-1].astype(np.float32) / SCALE
             invalid = np.zeros((th, tw), bool)
             process_window(x, y, series, _gate(A, B, invalid))
-        flush()
         # write the classes of the cells found in this tile
         for (rr, cc, k, _conf) in cells[n_before:]:
             out[rr - y:rr - y + CHIP, cc - x:cc - x + CHIP] = k
@@ -1178,13 +1637,7 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
         if progress:
             progress(int(100 * (ti + 1) / len(tiles)))
     ex.shutdown()
-    if fcache:
-        os.makedirs(cache_dir, exist_ok=True)
-        _ck = np.array(list(fcache.keys()), np.int32)
-        _cf = np.stack([fcache[k_] for k_ in fcache]).astype(np.float16)
-        np.savez(cache_path, keys=_ck, feats=_cf)
-        print(f"[forest_change] РєСЌС€ С„РёС‡ С‚РёРїРѕРІ СЃРѕС…СЂР°РЅС‘РЅ: {len(fcache)} С‡РёРїРѕРІ "
-              f"({os.path.getsize(cache_path) / 1e6:.0f} РњР‘)", flush=True)
+    store.close()
     band = None
     ds_out = None
     if hasattr(cfc, "close"):
@@ -1209,6 +1662,7 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
                "cells": len(cells),
                "used_mask": os.path.basename(mask_file) if use_mask else None,
                "areas_ha": n_px,
+               "feature_store": store.info(),
                "classes_tif": cls_path, "changes_gpkg": gpkg, "cells_gpkg": cells_path}
     with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2, ensure_ascii=False)
@@ -1216,6 +1670,7 @@ def predict(mode, model_path, out_dir, period=None, mosaic_dir=None, files=None,
 
 
 def _create_raster(path, gt, c0, r0, w, h, proj, nodata=255):
+    _DS_CACHE.pop(path, None)
     drv = gdal.GetDriverByName("GTiff")
     ds = drv.Create(path, w, h, 1, gdal.GDT_Byte, options=["COMPRESS=DEFLATE", "TILED=YES"])
     ds.SetGeoTransform((gt[0] + c0 * gt[1], gt[1], 0, gt[3] + r0 * gt[5], 0, gt[5]))
@@ -1238,6 +1693,12 @@ def _write_cells(path, cells, gt, c0, r0, proj, period, date1, date2):
                       ("period", ogr.OFTString), ("date1", ogr.OFTString), ("date2", ogr.OFTString)):
         layer.CreateField(ogr.FieldDefn(name, typ))
     defn = layer.GetLayerDefn()
+    txn = False
+    try:
+        layer.StartTransaction()
+        txn = True
+    except Exception:
+        pass
     for cid, (r, c, k, conf) in enumerate(cells):
         x0 = gt[0] + (c0 + c) * gt[1]
         y0 = gt[3] + (r0 + r) * gt[5]
@@ -1264,16 +1725,29 @@ def _write_cells(path, cells, gt, c0, r0, proj, period, date1, date2):
         feat.SetField("date2", str(date2))
         layer.CreateFeature(feat)
         feat = None
+    if txn:
+        layer.CommitTransaction()
     dst = None
 
 
 def _polygonize(classes_path, gpkg_path, proj):
     src = gdal.Open(classes_path)
-    band = src.GetRasterBand(1)
-    arr = band.ReadAsArray()
-    mask_arr = ((arr > 0) & (arr < 200)).astype(np.uint8)
-    mem = gdal.GetDriverByName("MEM").Create("", src.RasterXSize, src.RasterYSize, 1, gdal.GDT_Byte)
-    mem.GetRasterBand(1).WriteArray(mask_arr)
+    W, H = src.RasterXSize, src.RasterYSize
+    gt = src.GetGeoTransform()
+    tmp = classes_path + ".mask.tif"
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    mds = gdal.GetDriverByName("GTiff").Create(
+        tmp, W, H, 1, gdal.GDT_Byte, options=["TILED=YES", "COMPRESS=DEFLATE"])
+    mds.SetGeoTransform(gt)
+    mds.SetProjection(proj)
+    mb = mds.GetRasterBand(1)
+    for x, y, tw, th in _tiles(W, H):
+        arr = src.GetRasterBand(1).ReadAsArray(x, y, tw, th)
+        if arr is not None:
+            mb.WriteArray(((arr > 0) & (arr < 200)).astype(np.uint8), x, y)
+    mds = None
+    mask_ds = gdal.Open(tmp)
     srs = osr.SpatialReference()
     srs.ImportFromWkt(proj)
     if os.path.exists(gpkg_path):
@@ -1283,16 +1757,38 @@ def _polygonize(classes_path, gpkg_path, proj):
     layer.CreateField(ogr.FieldDefn("cls", ogr.OFTInteger))
     layer.CreateField(ogr.FieldDefn("type", ogr.OFTString))
     layer.CreateField(ogr.FieldDefn("area_ha", ogr.OFTReal))
-    gdal.Polygonize(band, mem.GetRasterBand(1), layer, 0, [], callback=None)
-    for feat in layer:
-        c = feat.GetField("cls")
-        area = round(feat.GetGeometryRef().GetArea() / 1e4, 3)
-        if MIN_AREA_HA > 0 and area < MIN_AREA_HA:
-            layer.DeleteFeature(feat.GetFID())
-            continue
-        feat.SetField("type", CLASSES.get(c, str(c)))
-        feat.SetField("area_ha", area)
-        layer.SetFeature(feat)
-    dst = None
+    gdal.Polygonize(src.GetRasterBand(1), mask_ds.GetRasterBand(1), layer, 0,
+                    [], callback=None)
+    txn = False
+    try:
+        layer.StartTransaction()
+        txn = True
+    except Exception:
+        pass
+    try:
+        for feat in layer:
+            geom = feat.GetGeometryRef()
+            if geom is None:
+                continue
+            c = feat.GetField("cls")
+            area = round(geom.GetArea() / 1e4, 3)
+            if MIN_AREA_HA > 0 and area < MIN_AREA_HA:
+                layer.DeleteFeature(feat.GetFID())
+                continue
+            feat.SetField("type", CLASSES.get(c, str(c)))
+            feat.SetField("area_ha", area)
+            layer.SetFeature(feat)
+        if txn:
+            layer.CommitTransaction()
+    except Exception:
+        if txn:
+            layer.RollbackTransaction()
+        raise
+    finally:
+        dst = None
+        mask_ds = None
+        src = None
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
