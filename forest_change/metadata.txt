@@ -1,4 +1,4 @@
-﻿[general]
+[general]
 name=Forest Change Detection (DOFA+CfC)
 qgisMinimumVersion=3.16
 qgisMaximumVersion=4.99
